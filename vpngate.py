@@ -296,14 +296,34 @@ def build_outputs(results, raw_count, sstp_count, source):
     return data
 
 # edgetunnel 入口地址池
+# 默认池 = 用户本地实测优选域名 (bestcf 三批结果合并去重, 电信网络实测 64-128ms, JP NRT / SG SIN 机房)。
+# 这些域名「更新时不动」: 见下方 EDGE_HOST_LOCKED —— 在自动更新中锁定, 不参与 DNS/TCP 检测。
+_DEFAULT_EDGE_HOSTS = (
+    "bbs.alipansou.com:443,cf-cname.xingpingcn.top:443,www.mfyx.cn:443,www.bangbenjiaju.com:443,www.giannidelprete.it:443,"
+    "c-power.com.cn:443,cf.090227.xyz:443,saas.sin.fan:443,www.sofi.com:443,cloudflare.idc.rocks:443,linear.app:443,uspto.gov:443,"
+    "www.dg22.top:443,m.iyf.tv:443,securecircle.com:443,dongbanghong.com:443,funko.com:443,dnew.cc:443,p.etime.vip:443,"
+    "www.vastnovel.com:443,vps.cheng2001.top:443,staticdelivery.nexusmods.com:443,www.dentoncounty.gov:443,eii.at:443,"
+    "www.broadcom.com:443,53.fs1.hubspotusercontent-na1.net:443,www.xflash.vip:443,ex.warspite.dpdns.org:443,cdn.7zz.cn:443,"
+    "wppaunz.com:443,saas.072159.xyz:443,www.sloomb.com:443,cf.3666888.xyz:443,serviceshub.samsclub.com:443,api.gzcrtw.com:443,"
+    "hzytjy.cn:443,spring.io:443,cf.xreak.top:443,www.vmware.com:443,cf.877774.xyz:443,store.ubi.com:443,www.swowd.com:443,"
+    "101yaoye.com:443,cdns.doon.eu.org:443,www.5199dy.com:443,cf.468123.xyz:443,openai.com:443,coreweave.com:443,cdn.cnno.de:443,"
+    "kickstarter.com:443,mfa.gov.ua:443,www.shopify.com:443,www.deepl.com:443,www.dbs.com.sg:443,cdn.ddeed.de:443,"
+    "academy.7shifts.com:443,www.akasantech.com:443,www.wuduanyun.com:443,fn.130519.xyz:443,guide.for.edu.sg:443,"
+    "mail.notion.com:443,www.xiaoshuofen.com:443,www.gov.il:443,thebeat.gehealthcare.com:443,jobsdb.com:443,www.leics.police.uk:443,"
+    "prizepicks.com:443,constitution.congress.gov:443,tt.78607323.xyz:443,www.carousell.sg:443,ikankeji.com:443,www.wto.org:443,"
+    "cmcc.cc.cd:443,cdn.204910.best:443,cf.qq.ms:443,egov.uscis.gov:443,www.zendesk.com:443,img.css.sd:443,www.blibli.com:443,"
+    "cf.nyanya.moe:443,auto.dolby.dpdns.org:443,cdn.jwcmdr.top:443,224322.xyz:443,www.jp.pima.gov:443,cf.92555.xyz:443,"
+    "cf.254301.xyz:443,01-cctv.com:443,stores.staples.com:443,cdn.555586.xyz:443,www.5h.com:443,lt.1930812.xyz:443,www.bis.gov:443,"
+    "cf.yj250.bond:443,test.509666.xyz:443,www.sage.com:443,01-qq.com:443,www.crazygames.fr:443,so.360832.xyz:443,"
+    "www.mastervolt.com:443,cf.itv888.cn:443,neko.cloudd.eu.org:443,versantstore.pearson.com:443,cdn.667891.xyz:443,"
+    "neko.cloudflaree.eu.org:443,aqua-aria.company:443,cdn.ctn32.us.kg:443,www.udacity.com:443,cfplus.255520.xyz:443,cdn.2x.nz:443,"
+    "ahrefs.com:443,ali.nonull.pp.ua:443,www.mc.js.cool:443,cf2.996616.xyz:443,d.lma.de5.net:443,markmonitor.com:443,"
+    "img.856518.xyz:443,cfip-ct.stoeaves.us.ci:443,cf.777791.xyz:443,login.rockwellautomation.com:443,idc.urkeji.com:443,"
+    "jellyfin.roddy.eu.cc:443,www.galgamex.net:443,kniu.cc:443,baota.us.kg:443,op.chinwa.eu.cc:443",
+)
 EDGE_HOSTS = [
     h.strip()
-    for h in os.environ.get(
-        "EDGE_HOSTS",
-        "saas.sin.fan:443,cdn.204910.best:443,www.mfyx.cn:443,p.etime.vip:443,cdn.ctn32.us.kg:443,cf.877774.xyz:443,spring.io:443,"
-        "cf.nyanya.moe:443,www.sloomb.com:443,op.chinwa.eu.cc:443,www.leics.police.uk:443,securecircle.com:443,www.shopify.com:443,"
-        "www.carousell.sg:443,www.dbs.com.sg:443,openai.com:443,linear.app:443,uspto.gov:443,www.vmware.com:443",
-    ).split(",")
+    for h in os.environ.get("EDGE_HOSTS", _DEFAULT_EDGE_HOSTS).split(",")
     if h.strip()
 ]
 
@@ -336,6 +356,12 @@ EDGE_HOST_BLACKLIST = {
 #   若日后新增 CNAME 类入口(解析不在 CF 段但 TLS 可达), 把域名填进来即可。
 EDGE_HOST_WHITELIST = {
     s.strip() for s in os.environ.get("EDGE_HOST_WHITELIST", "").split(",") if s.strip()
+}
+# 锁定名单: 默认 = 默认入口池 (用户本地实测优选域名), 更新时「不动」——
+# 这些域名跳过 DNS 污染检测与 TCP 检测, 在自动更新中永远保留。
+# 若某个域名希望参与检测, 用 EDGE_HOST_LOCKED 环境变量传入不含它的列表即可。
+EDGE_HOST_LOCKED = {
+    s.strip() for s in os.environ.get("EDGE_HOST_LOCKED", _DEFAULT_EDGE_HOSTS).split(",") if s.strip()
 }
 EDGE_DNS_TIMEOUT = float(os.environ.get("EDGE_DNS_TIMEOUT", "5"))
 EDGE_TCP_TIMEOUT = float(os.environ.get("EDGE_TCP_TIMEOUT", "6"))
@@ -463,6 +489,11 @@ def filter_edge_hosts(entries):
     for entry in entries:
         host, port = _split_host_port(entry)
         rec = {"host": host, "status": "ok", "ips": [], "reasons": []}
+        # 第 0 步: 锁定域名直接保留 (更新时不动, 不参与 DNS/TCP 检测)
+        if host in EDGE_HOST_LOCKED:
+            log("EDGE DNS", f"  [LOCK] {host:<24} 锁定, 更新时不动")
+            checked.append(rec)
+            continue
         try:
             for server in CN_DNS_LIST:
                 try:
