@@ -17,26 +17,65 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
 
+      # 关键: 用 python -m pip 安装, 保证「装依赖的解释器」和「跑脚本的解释器」是同一个。
+      # 旧写法 `pip install -r requirements.txt` 依赖 PATH 顺序, 一旦 pip 落到另一个解释器上,
+      # 下一步 `python vpngate.py` 会在 import requests 时瞬间退出 (退出码 1, 步骤耗时 0 秒)。
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -V
+          python -m pip -V
+          python -m pip install --disable-pip-version-check -r requirements.txt
+          python -c "import requests, sys; print('依赖自检通过: requests', requests.__version__, '| python', sys.version.split()[0])"
 
       - name: Get VPN Gate nodes + check via Cloudflare Worker + build page
         run: python vpngate.py
         env:
           # 已部署的检测 Worker (不要改动: 检测统一走这里)
           CHECK_WORKER: ${{ secrets.DOMAIN }}
-          CHECK_CONCURRENCY: "32"
-          CHECK_TIMEOUT: "90"
+          # Worker 上游有免费额度限制: 实测 32 并发会大面积返回 429 -> success=false (被误判成节点不通),
+          # 因此并发降到 4, 并允许检测服务异常时重试。
+          CHECK_CONCURRENCY: "4"
+          CHECK_TIMEOUT: "60"
+          CHECK_RETRIES: "2"
+          CHECK_BACKOFF: "2"
+          CHECK_MIN_INTERVAL: "0.25"
+          # 数据源重试 (官方 API 抖动时自动重试, 再回退到 GitHub 镜像)
+          FETCH_RETRIES: "3"
+          FETCH_BACKOFF: "3"
+          # 可用节点少于该值时, 若上一版更多则保留上一版 (避免把订阅改差)
+          MIN_SUCCESS: "5"
+          # 想要「降级也把这次运行标红」就把下一行打开
+          # STRICT: "1"
+
+      # 无论成功 / 降级 / 失败都打印关键产物与结论, 一眼定位问题
+      - name: 运行结果汇总
+        if: always()
+        run: |
+          echo "job status: ${{ job.status }}"
+          if [ -f public/status.json ]; then
+            echo "---------- public/status.json ----------"
+            cat public/status.json
+          else
+            echo "public/status.json 不存在 (脚本在生成产物前就退出了)"
+          fi
+          if [ -f public/nodes.txt ]; then
+            echo "---------- public/nodes.txt 前 3 行 (共 $(wc -l < public/nodes.txt) 行) ----------"
+            head -n 3 public/nodes.txt
+          else
+            echo "public/nodes.txt 不存在"
+          fi
 
       - name: Sync Check Worker script (auto-update every run)
         run: |
@@ -68,16 +107,20 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Configure Pages
-        uses: actions/configure-pages@v5
+        uses: actions/configure-pages@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
+        uses: actions/upload-pages-artifact@v5
         with:
           path: 'public'
 
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Show site URL
         run: 'echo "site: https://200111226011qw-debug.github.io/gate/ (deploy outcome: ${{ steps.deployment.outcome }})"'
