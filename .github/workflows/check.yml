@@ -1,6 +1,8 @@
 name: VPN Gate Node Check
 
 on:
+  schedule:
+    - cron: "0 */12 * * *"
   workflow_dispatch:
 
 permissions:
@@ -32,7 +34,7 @@ jobs:
         run: python vpngate.py
         env:
           # 已部署的检测 Worker (不要改动: 检测统一走这里)
-        CHECK_WORKER: ${{ secrets.DOMAIN }}
+          CHECK_WORKER: ${{ secrets.DOMAIN }}
           CHECK_CONCURRENCY: "32"
           CHECK_TIMEOUT: "90"
 
@@ -47,7 +49,7 @@ jobs:
             curl -sS -X PUT \
               -H "Authorization: Bearer $GITHUB_TOKEN" \
               -H "Content-Type: application/json" \
-              -d '{"build_type":"workflow","source":{"branches":["main"],"path":"/public"}}' \
+              -d '{"build_type":"workflow","source":{"branch":"main","path":"/public"}}' \
               "https://api.github.com/repos/$GITHUB_REPOSITORY/pages"
             echo
             sleep 10
