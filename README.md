@@ -61,6 +61,7 @@ edgetunnel 后台「自定义优选IP」框填 https://…/nodes.txt
 3. 把 `_worker.js` 的全部内容粘贴进编辑器，点「部署」
 4. 记下这个 Worker 的域名，形如 `https://xxx.你的用户名.workers.dev`
 5. 验证：浏览器打开 `https://你的Worker域名/check?sstp=vpn:vpn@任意节点:端口` ，能返回 JSON 即成功
+6. **脚本自动同步**：本仓库 workflow 每 12 小时自动从上游拉取最新 `_worker.js`，发布到 `https://你的GitHub用户名.github.io/仓库名/check-worker.js`。以后想更新 Worker 代码，直接打开这个地址复制粘贴即可（详见 `check-worker/README.md`）
 
 ### 第 3 步：Fork 本仓库
 
