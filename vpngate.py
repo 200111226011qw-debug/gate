@@ -15,7 +15,10 @@ import csv
 import io
 import json
 import os
+import random
 import re
+import socket
+import struct
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -299,18 +302,232 @@ EDGE_HOSTS = [
         "EDGE_HOSTS",
         "saas.sin.fan:443,cdn.204910.best:443,www.mfyx.cn:443,p.etime.vip:443,cdn.ctn32.us.kg:443,cf.877774.xyz:443,spring.io:443,"
         "cf.nyanya.moe:443,www.sloomb.com:443,op.chinwa.eu.cc:443,www.leics.police.uk:443,securecircle.com:443,www.shopify.com:443,"
-        "www.carousell.sg:443,www.dbs.com.sg:443,openai.com:443,linear.app:443,www.bilibili.com:443,uspto.gov:443,www.vmware.com:443",
+        "www.carousell.sg:443,www.dbs.com.sg:443,openai.com:443,linear.app:443,uspto.gov:443,www.vmware.com:443",
     ).split(",")
     if h.strip()
 ]
 
 NODES_URL = os.environ.get("NODES_URL", "https://200111226011qw-debug.github.io/gate/nodes.txt")
 
-def build_nodes_text(data):
+# ---------------------------------------------------------------------------
+# 入口域名 DNS 污染检测
+# ---------------------------------------------------------------------------
+# 背景: 入口域名若被 DNS 污染 (解析到无关 IP), 客户端连接会超时,
+#表现为 v2rayN / Clash 里延迟全是 -1。这里在生成节点前主动剔除。
+#
+# 注意: 检测结果反映的是「运行本脚本的这台机器」的网络环境。
+# 若在 GitHub Actions (境外 runner) 上运行, 检测到的是境外视角,
+# 无法反映墙内污染 —— 此时信号1 通常不会命中, 不会误剔除。
+CN_DNS_LIST = [
+    s.strip()
+    for s in os.environ.get("CN_DNS", "223.5.5.5,119.29.29.29,114.114.114.114").split(",")
+    if s.strip()
+]
+EDGE_DNS_CHECK = os.environ.get("EDGE_DNS_CHECK", "1") not in ("0", "false", "False")
+
+# 黑名单: 已知无法作为 Cloudflare 优选入口的域名, 直接剔除, 不参与检测。
+#   www.bilibili.com —— 实测解析到 119.84.x / 183.131.x 等国内 IP, 不走 Cloudflare 网段。
+#   TCP 虽通, 但 TLS 无法路由到 Worker, 作为入口无效。
+EDGE_HOST_BLACKLIST = {
+    s.strip() for s in os.environ.get("EDGE_HOST_BLACKLIST", "www.bilibili.com").split(",") if s.strip()
+}
+# 白名单: 经检测确认「不走 CF 网段但确实可用」的入口, 跳过网段校验只测连通性。
+#   默认为空 —— 当前 20 个入口中仅 bilibili 异常, 已归入黑名单, 无需豁免。
+#   若日后新增 CNAME 类入口(解析不在 CF 段但 TLS 可达), 把域名填进来即可。
+EDGE_HOST_WHITELIST = {
+    s.strip() for s in os.environ.get("EDGE_HOST_WHITELIST", "").split(",") if s.strip()
+}
+EDGE_DNS_TIMEOUT = float(os.environ.get("EDGE_DNS_TIMEOUT", "5"))
+EDGE_TCP_TIMEOUT = float(os.environ.get("EDGE_TCP_TIMEOUT", "6"))
+
+# Cloudflare IPv4 网段
+CF_V4 = ((104, 16, 104, 31), (172, 64, 172, 127), (162, 158, 162, 159), (198, 41, 198, 41))
+
+
+def _split_host_port(entry):
+    """把 'example.com:443' 拆成 ('example.com', '443'), 无端口则端口为 None"""
+    if ":" in entry and not entry.rstrip().endswith("]"):
+        host, _, port = entry.rpartition(":")
+        if host and port.isdigit():
+            return host, port
+    return entry, None
+
+
+def _is_cloudflare(ip):
+    if not ip:
+        return False
+    if ":" in ip:  # Cloudflare IPv6 段 2a06:4700::/32
+        return ip.lower().startswith("2a06:4700")
+    parts = ip.split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        a, b = int(parts[0]), int(parts[1])
+    except ValueError:
+        return False
+    for sa, sb, ea, eb in CF_V4:
+        if a == sa and sb <= b <= eb:
+            return True
+    return False
+
+
+def _dns_build_query(domain):
+    qid = random.randint(1, 0xFFFF)
+    header = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)
+    qname = b""
+    for label in domain.split("."):
+        qname += bytes([len(label)]) + label.encode("ascii")
+    return qid, header + qname + b"\x00" + struct.pack(">HH", 1, 1)
+
+
+def _dns_skip_name(buf, offset):
+    while True:
+        if offset >= len(buf):
+            raise ValueError("dns name out of range")
+        length = buf[offset]
+        if length == 0:
+            return offset + 1
+        if length & 0xC0 == 0xC0:
+            return offset + 2
+        offset += 1 + length
+
+
+def _dns_query_a(domain, server, timeout=EDGE_DNS_TIMEOUT):
+    """UDP 查询 A 记录。失败抛异常, 无记录返回 []。"""
+    qid, packet = _dns_build_query(domain)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(packet, (server, 53))
+        data, _ = sock.recvfrom(4096)
+    finally:
+        sock.close()
+    if len(data) < 12:
+        raise ValueError("short dns response")
+    rid, flags, qd, an = struct.unpack(">HHHH", data[:8])
+    if rid != qid:
+        raise ValueError("dns id mismatch")
+    if flags & 0x0F != 0:
+        raise ValueError(f"dns rcode={flags & 0x0F}")
+    if an == 0:
+        return []
+    offset = 12
+    for _ in range(qd):
+        offset = _dns_skip_name(data, offset) + 4
+    ips = []
+    for _ in range(an):
+        offset = _dns_skip_name(data, offset)
+        if offset + 10 > len(data):
+            break
+        rtype, _cls, _ttl, rdlen = struct.unpack(">HHIH", data[offset:offset + 10])
+        offset += 10
+        rdata = data[offset:offset + rdlen]
+        offset += rdlen
+        if rtype == 1 and rdlen == 4:
+            ips.append(socket.inet_ntoa(rdata))
+    return ips
+
+
+def _tcp_ok(host, port=443, timeout=EDGE_TCP_TIMEOUT):
+    try:
+        socket.create_connection((host, int(port or 443)), timeout=timeout).close()
+        return True
+    except OSError:
+        return False
+
+
+def filter_edge_hosts(entries):
+    """剔除黑名单域名, 以及被 DNS 污染或 TCP 不通的入口域名。全部不可用时保留原列表。"""
+    if not entries:
+        return entries
+
+    # 第 1 步: 黑名单直接剔除 (无需检测)
+    if EDGE_HOST_BLACKLIST:
+        kept, dropped = [], []
+        for entry in entries:
+            host, _ = _split_host_port(entry)
+            (dropped if host in EDGE_HOST_BLACKLIST else kept).append(entry)
+        if dropped:
+            log("EDGE DNS", f"黑名单剔除: {', '.join(_split_host_port(e)[0] for e in dropped)}")
+        entries = kept
+        if not entries:
+            log("EDGE DNS", "警告: 黑名单后列表为空, 跳过 DNS 检测")
+            return []
+
+    if not EDGE_DNS_CHECK or not entries:
+        return entries
+
+    log("EDGE DNS", f"检测入口域名污染: {len(entries)} 个 (DNS {', '.join(CN_DNS_LIST)})")
+
+    checked = []
+    for entry in entries:
+        host, port = _split_host_port(entry)
+        rec = {"host": host, "status": "ok", "ips": [], "reasons": []}
+        try:
+            for server in CN_DNS_LIST:
+                try:
+                    ips = _dns_query_a(host, server)
+                    if ips:
+                        rec["ips"] = ips
+                        break
+                except Exception:
+                    continue
+            if not rec["ips"]:
+                rec["status"] = "bad"
+                rec["reasons"].append("国内 DNS 无 A 记录")
+            else:
+                # 信号1: 解析结果是否落在 Cloudflare 网段 (白名单跳过)
+                if host not in EDGE_HOST_WHITELIST and not any(_is_cloudflare(ip) for ip in rec["ips"]):
+                    rec["status"] = "bad"
+                    rec["reasons"].append(f"解析非 Cloudflare 网段 (疑似污染): {','.join(rec['ips'][:3])}")
+                # 信号2: TCP 可达性
+                if rec["status"] == "ok" and not _tcp_ok(host, port):
+                    rec["status"] = "bad"
+                    rec["reasons"].append("TCP 连接失败")
+        except Exception as exc:
+            rec["status"] = "unknown"
+            rec["reasons"].append(f"检测异常: {type(exc).__name__}")
+        checked.append(rec)
+        if rec["status"] == "ok":
+            log("EDGE DNS", f"  [OK]   {host:<24} {','.join(rec['ips'][:2])}")
+        else:
+            log("EDGE DNS", f"  [{rec['status'].upper():<5}] {host:<24} {'; '.join(rec['reasons'])}")
+
+    healthy = [r["host"] for r in checked if r["status"] == "ok"]
+    bad = [r for r in checked if r["status"] != "ok"]
+
+    # 重建原格式 entry (保留端口)
+    healthy_entries = []
+    for entry in entries:
+        host, _ = _split_host_port(entry)
+        if host in healthy:
+            healthy_entries.append(entry)
+
+    log("EDGE DNS", f"健康 {len(healthy_entries)} / 异常 {len(bad)}")
+    if bad:
+        log("EDGE DNS", f"剔除: {', '.join(r['host'] for r in bad)}")
+
+    # 全部异常时保留原列表, 绝不产出空订阅
+    if not healthy_entries:
+        log("EDGE DNS", "警告: 无域名通过检测, 沿用完整列表 (避免产出空订阅)")
+        return entries
+
+    return healthy_entries
+
+
+def build_nodes_text(data, edge_hosts=None):
     """生成纯节点行版本 (无注释): 每行 = 入口地址#名字$sstp://..."""
     countries = data["countries"]
     _entry = os.environ.get("HOSTS_ENTRY", "").strip()
-    edge = [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS
+    base = [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS
+    # DNS 污染过滤 (仅在未显式指定 HOSTS_ENTRY 时生效, 保证人工指定优先)
+    if not _entry:
+        base = filter_edge_hosts(base)
+    # 兜底: 极端情况下 (如黑名单清空列表) 回退到原始 EDGE_HOSTS, 避免除零/空轮换
+    if not base:
+        log("EDGE DNS", "警告: 筛选结果为空, 回退到完整入口列表")
+        base = list(EDGE_HOSTS)
+    edge = edge_hosts or base
     lines = []
     idx = 0
     ordered = sorted(countries.items(), key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])))
