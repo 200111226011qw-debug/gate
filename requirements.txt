@@ -1,1 +1,2 @@
-requests
+# 固定版本: 避免上游发布破坏自动更新 (要升级时改这里, 并在本地跑一次 tests/run_tests.py)
+requests==2.34.2
