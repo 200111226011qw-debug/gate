@@ -38,6 +38,16 @@ jobs:
           CHECK_CONCURRENCY: "32"
           CHECK_TIMEOUT: "90"
 
+      - name: Sync Check Worker script (auto-update every run)
+        run: |
+          mkdir -p public
+          if curl -fsSL --retry 2 -o public/check-worker.js \
+            "https://raw.githubusercontent.com/lsh8848/cm-Workers-CheckSocks5/refs/heads/main/_worker.js"; then
+            echo "检测 Worker 脚本已同步: $(wc -c < public/check-worker.js) bytes"
+          else
+            echo "警告: 检测 Worker 脚本同步失败 (不影响本轮节点生成, 保留旧副本)"
+          fi
+
       - name: Ensure GitHub Pages is enabled (one-time auto setup)
         run: |
           code=$(curl -s -o /dev/null -w '%{http_code}' \
