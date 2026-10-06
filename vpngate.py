@@ -321,11 +321,16 @@ _DEFAULT_EDGE_HOSTS = (
     "img.856518.xyz:443,cfip-ct.stoeaves.us.ci:443,cf.777791.xyz:443,login.rockwellautomation.com:443,idc.urkeji.com:443,"
     "jellyfin.roddy.eu.cc:443,www.galgamex.net:443,kniu.cc:443,baota.us.kg:443,op.chinwa.eu.cc:443",
 )
-EDGE_HOSTS = [
-    h.strip()
-    for h in os.environ.get("EDGE_HOSTS", _DEFAULT_EDGE_HOSTS).split(",")
-    if h.strip()
-]
+
+def _parse_host_list(raw):
+    """把逗号分隔字符串解析成去空白域名列表"""
+    return [h.strip() for h in raw.split(",") if h.strip()]
+
+# 默认入口池展平为单域名列表 (元组内每个元素是多域名拼接段)
+_DEFAULT_EDGE_HOST_LIST = list(dict.fromkeys(h for seg in _DEFAULT_EDGE_HOSTS for h in _parse_host_list(seg)))
+
+# 环境变量 EDGE_HOSTS 优先; 未设置时用默认池 (用户本地实测优选域名, 更新时不动)
+EDGE_HOSTS = _parse_host_list(os.environ.get("EDGE_HOSTS", "")) or _DEFAULT_EDGE_HOST_LIST
 
 NODES_URL = os.environ.get("NODES_URL", "https://200111226011qw-debug.github.io/gate/nodes.txt")
 
@@ -360,9 +365,7 @@ EDGE_HOST_WHITELIST = {
 # 锁定名单: 默认 = 默认入口池 (用户本地实测优选域名), 更新时「不动」——
 # 这些域名跳过 DNS 污染检测与 TCP 检测, 在自动更新中永远保留。
 # 若某个域名希望参与检测, 用 EDGE_HOST_LOCKED 环境变量传入不含它的列表即可。
-EDGE_HOST_LOCKED = {
-    s.strip() for s in os.environ.get("EDGE_HOST_LOCKED", _DEFAULT_EDGE_HOSTS).split(",") if s.strip()
-}
+EDGE_HOST_LOCKED = set(_parse_host_list(os.environ.get("EDGE_HOST_LOCKED", ""))) or set(_DEFAULT_EDGE_HOST_LIST)
 EDGE_DNS_TIMEOUT = float(os.environ.get("EDGE_DNS_TIMEOUT", "5"))
 EDGE_TCP_TIMEOUT = float(os.environ.get("EDGE_TCP_TIMEOUT", "6"))
 
