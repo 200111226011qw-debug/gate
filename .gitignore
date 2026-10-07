@@ -3,4 +3,7 @@ public/
 __pycache__/
 *.pyc
 
-Copy
+# tests/ 的生成物 (运行产物与合成样本), 不入库
+tests/runs/
+tests/runs-repro/
+tests/_synthesized_*.py

@@ -114,48 +114,100 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 入口地址用的是「优选域名」，决定客户端连 Cloudflare 用哪个 IP、稳不稳。
 
 ### 在哪个文件改
-- 文件：vpngate.py
-- 位置：`EDGE_HOSTS = [ ... ]`
+- 文件：`vpngate.py`
+- 位置：`_DEFAULT_EDGE_HOSTS`（当前 125 个，bestcf 三批实测结果合并去重）
 
-### 改法
-1. 用测速工具（如 bestcf）测一批 Cloudflare 优选域名，挑「延迟低 + 实际能连通」的
-2. 打开 vpngate.py，把 `EDGE_HOSTS` 里的域名列表换成你测出来的（逗号分隔，格式 `域名:443`）
-3. 提交推送，等下一次自动运行或手动触发 Action
+### 改法（两种，任选其一）
+1. **改常量**（推荐）：打开 `vpngate.py`，把 `_DEFAULT_EDGE_HOSTS` 里的域名列表换成你测出来的（逗号分隔，格式 `域名:443`），提交推送，等下一次自动运行或手动触发 Action。
+2. **用环境变量覆盖**（不动代码）：在 `.github/workflows/check.yml` 主步骤的 `env:` 里加一行 `EDGE_HOSTS: "a.com:443,b.com:443"`。
+
+### 关于「锁定」（更新时不动）
+`EDGE_HOST_LOCKED` 默认等于 `_DEFAULT_EDGE_HOSTS`：**锁定名单里的域名在自动更新中永远保留** —— 跳过 DNS 污染检测与 TCP 连通性检测。
+
+> 设计意图：`_DEFAULT_EDGE_HOSTS` 放的是你自己实测过、确定可用的域名，机器人不要自作主张去动它们。
+> 若某个域名希望重新参与自动检测，用 `EDGE_HOST_LOCKED` 环境变量传入一个「不含它」的列表即可。
 
 ---
 
-## 四、配置速查表（vpngate.py）
+## 四、配置速查表（vpngate.py / workflow env）
 
-| 常量 | 说明 |
-| :--- | :--- |
-| `EDGE_HOSTS` | 入口优选域名（换域名改这里） |
-| `WORKER_CHECK_URL` | 检测 Worker（本地运行默认值，Action 里用 workflow 的 `CHECK_WORKER` 覆盖） |
-| `NODES_URL` | 自动更新时用到的固定地址（fork 后改成你自己的） |
+| 名称 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `_DEFAULT_EDGE_HOSTS` | 125 个实测域名 | 入口优选域名池（换域名改这里） |
+| `EDGE_HOSTS` | = 默认池 | 覆盖入口池（环境变量） |
+| `EDGE_HOST_LOCKED` | = 默认池 | 锁定名单：**按主机名存**（不带 `:端口`），不参与 DNS/TCP 检测，更新时不动 |
+| `CHECK_WORKER` | 无（必填） | 检测 Worker，形如 `https://xxx/check?sstp=vpn:vpn@`（Actions 里来自 `secrets.DOMAIN`） |
+| `CHECK_CONCURRENCY` | `4` | 检测并发。**不要调大**：Worker 上游有免费额度，32 并发会大面积 429 |
+| `CHECK_TIMEOUT` | `60` | 单次检测超时（秒） |
+| `CHECK_RETRIES` | `2` | 检测服务异常（429/5xx/超时）时的额外重试次数 |
+| `CHECK_BACKOFF` | `2` | 重试退避基数（秒），线性增长 + 抖动 |
+| `FETCH_RETRIES` | `3` | 每个数据源的抓取重试次数 |
+| `MIN_SUCCESS` | `5` | 可用节点少于该值时，若上一版更多则保留上一版 |
+| `KEEP_LAST_GOOD` | `1` | 置 `0` 关闭「沿用上一版产物」的降级能力 |
+| `STRICT` | `0` | 置 `1`：降级也算失败（运行标红），默认只告警不标红 |
+| `NODES_URL` / `DATA_URL` | 本仓库 Pages 地址 | 自动更新用到的固定地址（fork 后改成你自己的） |
 
 > 再次强调：`vpngate.py` **不需要**配置 `EDT_UUID` 和 `EDT_DOMAIN`，这两个参数属于 edgetunnel 本身。
 
 ---
 
-## 五、常见问题
+## 五、自动更新的健壮性设计（为什么不会再「整轮挂掉」）
+
+每次运行都会在 `public/status.json`（同时发布到 Pages）写下结论：
+
+| `outcome` | 含义 | 退出码 |
+| :--- | :--- | :--- |
+| `fresh` | 本轮拿到新数据并已发布 | 0（绿色） |
+| `stale` | 本轮数据源/检测服务异常 → **沿用上一版产物**，订阅不中断 | 0（绿色 + `::warning::` 注解） |
+| `failed` | 既拿不到新数据、又没有上一版产物 → 不发布空订阅 | 1（红色） |
+
+关键规则：
+
+1. **绝不发布空订阅**：只要本轮 0 个可用节点，就沿用上一版 `nodes.txt`（不会把 edgetunnel 的订阅清空）。
+2. **数据源多源 + 退避重试**：官方 API（`http://www.vpngate.net/api/iphone/`）失败自动重试，再回退 GitHub 镜像。
+3. **区分「节点不通」与「检测服务故障」**：Worker 返回 429、5xx、超时、`/api/lookup` 报错 → 属于检测服务故障，会自动重试；只有 `SSTP ...` 这类才是节点真的不通。
+4. **诊断摘要**：无论成功还是降级，日志末尾都会打印一段「诊断摘要」（python/requests 版本、Worker 地址、并发与重试、入口池大小、成功/失败计数、耗时），出问题直接照抄即可。
+5. **完整 traceback**：脚本异常时打印完整调用栈，不再只留一行信息。
+6. **发布前产物自检**：`validate_nodes_text()` 逐行校验 `nodes.txt`（入口与节点主机必须是域名），格式不合格就**拒绝发布**并降级沿用上一版 —— 防止「运行绿色但订阅是坏的」（2026-10-07 踩过这个坑：入口池被按字符拆开，每行入口变成单个字母，而当时测试只数行数）。
+7. **入口池解析**：`_env_csv()` 统一读取「逗号分隔」配置，**返回条目列表**，调用方不需要（也无法忘记）`.split(",")`。
+
+> 想本地验证这些行为（无需联网）：`python tests/run_tests.py`（18 组故障场景，对比加固前后）。
+
+---
+
+## 六、常见问题
 
 ### 只有几个节点能连
-入口优选域名大部分被墙。用 bestcf 重新测速，把 `EDGE_HOSTS` 换成实测能通的域名。
+入口优选域名大部分被墙。用 bestcf 重新测速，把 `_DEFAULT_EDGE_HOSTS` 换成实测能通的域名。
 
 ### 全部 -1
 检查：edgetunnel 是否部署好、域名是否解析到 Cloudflare、UUID 是否填对、传输协议是否对得上。
 
 ### 12 小时没更新
-到 Actions 页看最近一次运行是否成功、cron 是否还在。
+到 Actions 页看最近一次运行；再看 `https://你的用户名.github.io/仓库名/status.json` 的 `outcome` 与 `reason`。
 
-### 检测 Worker 报错
-确认 Worker 部署成功、域名填对（workflow 里的 `CHECK_WORKER`），浏览器直接访问 `https://你的Worker/check?sstp=...` 看是否返回 JSON。
+### 运行「0 秒」就失败（退出码 1）
+说明脚本在**导入阶段**就炸了，最常见的两类原因：
+1. `AttributeError: 'tuple' object has no attribute 'split'` —— 入口池常量被写成元组、又直接传给了 `os.environ.get()` 的默认值（2026-10-06 那次就是这个）。加固版已用 `_env_csv()` 统一归一化，不会再犯。
+2. `ModuleNotFoundError: No module named 'requests'` —— pip 装依赖的解释器和跑脚本的解释器不是同一个。workflow 已改成 `python -m pip install` 并加了 `import requests` 自检。
+
+### 运行是绿的，但节点没换（`status.json` 里 `outcome=stale`）
+说明本轮没产出新数据，沿用了上一版。看 `reason` 字段：
+- `检测服务全部异常 ... 429` → Worker 上游额度被打满。加固版已把并发降到 4 并自动重试；若仍然如此，说明 Worker 自身的上游额度/密钥需要处理（到 Cloudflare 看 Worker 日志）。
+- `所有数据源都不可用` → VPN Gate 官方 API 与镜像同时挂了，等下一轮即可。
+- `CHECK_WORKER 未配置或非法` → 仓库 Secrets 里的 `DOMAIN` 丢了，重新设置成 `https://你的Worker域名/check?sstp=vpn:vpn@`。
+
+### 检测 Worker 报错 / 大面积成功率为 0
+浏览器直接打开 `https://你的Worker/check?sstp=vpn:vpn@任意节点:端口` 看返回的 JSON：
+- `"error": "... 429 Too Many Requests"` → Worker 上游限速，降低 `CHECK_CONCURRENCY` 或换用自带额度的查询接口。
+- `"error": "SSTP server connection timed out"` → 该节点确实不通，属正常现象。
 
 ### 不知道 UUID 和节点域名在哪里看
 登录 edgetunnel 后台（`https://你的域名/admin`），在后台首页就能看到。
 
 ---
 
-*流水线：GitHub Actions（每 12 小时 cron） → vpngate.py → 检测 Worker → GitHub Pages*
+*流水线：GitHub Actions（每 12 小时 cron） → vpngate.py（多数据源 + 重试 + 降级） → 检测 Worker → GitHub Pages*
 
 ---
 
