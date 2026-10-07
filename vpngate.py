@@ -102,6 +102,15 @@ MIN_SUCCESS = max(1, int(os.environ.get("MIN_SUCCESS", "5")))          # 成功�
 KEEP_LAST_GOOD = os.environ.get("KEEP_LAST_GOOD", "1") not in ("0", "false", "False")
 STRICT = os.environ.get("STRICT", "0") in ("1", "true", "True")        # 1 = 降级也算失败 (退出码 1)
 
+# 端点体检 (edgetunnel / 订阅入口等)。注意: 这与 nodes.txt 里的「优选入口域名」是两层东西 ——
+#   nodes.txt 的入口 = 客户端实际连接的 Cloudflare 优选域名 (由 filter_edge_hosts 检测)
+#   这里探测的端点 = 你自己的订阅/Worker 域名 (如 https://zai.ppdk.eu.cc/)
+# 只做体检并写入 endpoints.json / status.json, **绝不参与 nodes.txt 生成**, 因此不会打坏链式代理。
+ENDPOINT_URLS = _env_csv("ENDPOINT_URLS", "")                          # 逗号分隔; 空 = 关闭该功能 (零行为变化)
+ENDPOINT_TIMEOUT = float(os.environ.get("ENDPOINT_TIMEOUT", "15"))
+_EDGE_ERROR_CODES = (520, 521, 522, 523, 524, 525, 526, 527)
+_endpoint_report = []                                                  # 由 main() 填充, build_status() 读取
+
 DATA_CENTER_ORG_KEYWORDS = [
     "GOOGLE", "AMAZON", "AWS", "MICROSOFT", "OVH", "HETZNER", "DIGITALOCEAN",
     "AKAMAI", "CLOUDFLARE", "FASTLY", "RACKSPACE", "EQUINIX", "LINODE", "VULTR",
@@ -254,7 +263,7 @@ def parse_mirror_json(data):
         host = str(s.get("hostname") or s.get("host") or "").strip()
         ip = str(s.get("ip") or "").strip()
         if not host or not ip: continue
-        rows.append({"host": host, "ip": ip, "country_long": str(s.get("countrylong") or s.get("country_long") or s.get("country") or "").strip(), "country_short": str(s.get("countryshort") or s.get("country_short") or "").strip(), "config_b64": str(s.get("openvpn_configdata_base64") or s.get("config_b64") or "").strip()})
+        rows.append({"host": host, "ip": ip, "country_long": str(s.get("countrylong") or s.get("country_long") or s.get("country") or "").strip(), "country_short": str(s.get("countryshort") or s.get("country_short") or s.get("country") or "").strip(), "config_b64": str(s.get("openvpn_configdata_base64") or s.get("config_b64") or "").strip()})
     return rows
 
 # ---------------------------------------------------------------------------
@@ -429,6 +438,48 @@ def check_all(nodes, session):
 # ---------------------------------------------------------------------------
 # 生成数据
 # ---------------------------------------------------------------------------
+def probe_endpoints(session):
+    """体检用户自己的端点 (订阅/Worker 域名)。只读探测, 不改任何产物语义。
+
+    分类:
+      ok          2xx/3xx              -> 正常
+      reachable   4xx (含 401/403/404) -> 站点活着 (鉴权/路径问题另说)
+      edge_error  52x                  -> Cloudflare 边缘连不上后端 (本次 522 事故的形态)
+      server_error 5xx                 -> 后端自己报错
+      down        连接类异常/超时/DNS  -> 完全不可达
+    """
+    report = []
+    for url in ENDPOINT_URLS:
+        started = time.time()
+        rec = {"url": url, "status": "unknown", "http": None, "ms": None, "error": None}
+        try:
+            resp = session.get(url, timeout=ENDPOINT_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-endpoint-probe)"})
+            rec["http"] = resp.status_code
+            if resp.status_code in _EDGE_ERROR_CODES:
+                rec["status"], rec["error"] = "edge_error", f"Cloudflare {resp.status_code}"
+            elif resp.status_code >= 500:
+                rec["status"], rec["error"] = "server_error", f"HTTP {resp.status_code}"
+            elif resp.status_code >= 400:
+                rec["status"] = "reachable"
+            else:
+                rec["status"] = "ok"
+        except Exception as exc:
+            rec["status"] = "down"
+            rec["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            rec["ms"] = int((time.time() - started) * 1000)
+        report.append(rec)
+        log("ENDPOINT", f"  {rec['status']:<12} {url}  HTTP={rec['http']} {rec['ms']}ms {rec['error'] or ''}")
+    return report
+
+
+def endpoint_summary(report):
+    total = len(report or [])
+    bad = [r for r in (report or []) if r["status"] not in ("ok", "reachable")]
+    return {"total": total, "alive": total - len(bad), "abnormal": len(bad),
+            "abnormal_urls": [r["url"] for r in bad]}
+
+
 def build_outputs(results, raw_count, sstp_count, source):
     available = [r for r in results if r.get("success")]
     countries = {}
@@ -874,6 +925,8 @@ def build_status(outcome, reason, started, **extra):
         "check_retries": CHECK_RETRIES,
         "entry_hosts": len(EDGE_HOSTS),
         "entry_hosts_locked": len(EDGE_HOST_LOCKED),
+        "endpoints": list(_endpoint_report),
+        "endpoints_summary": endpoint_summary(_endpoint_report),
         "run_id": os.environ.get("GITHUB_RUN_ID") or None,
     }
     status.update({k: v for k, v in extra.items() if v is not None})
@@ -889,6 +942,9 @@ def log_diagnostics(status):
     print(f"  Worker      : {WORKER_CHECK_URL or '(未配置)'}  合法={WORKER_URL_OK}")
     print(f"  并发/重试   : {CONCURRENCY} / {CHECK_RETRIES} (最小间隔 {CHECK_MIN_INTERVAL}s)")
     print(f"  入口池      : {len(EDGE_HOSTS)} 个 (锁定 {len(EDGE_HOST_LOCKED)} 个)")
+    es = status.get("endpoints_summary") or {}
+    if es.get("total"):
+        print(f"  端点体检    : {es['alive']}/{es['total']} 正常" + (f" — 异常: {', '.join(es['abnormal_urls'])}" if es.get("abnormal") else ""))
     stats = status.get("stats") or {}
     if stats:
         print("  本轮统计    : " + ", ".join(f"{k}={v}" for k, v in stats.items()))
@@ -924,10 +980,21 @@ def finish_degraded(session, reason, started, last_good=None, **stats):
 # main
 # ---------------------------------------------------------------------------
 def main():
+    global _endpoint_report
     session = requests.Session()
     started = time.time()
 
     log("ENV", f"python {sys.version.split()[0]} | requests {getattr(requests, '__version__', '?')} | 并发 {CONCURRENCY} | 检测重试 {CHECK_RETRIES} | Worker {'已配置' if WORKER_URL_OK else '未配置/非法'}")
+
+    if ENDPOINT_URLS:
+        log("ENDPOINT", f"端点体检: {len(ENDPOINT_URLS)} 个 (仅体检, 不影响 nodes.txt)")
+        _endpoint_report = probe_endpoints(session)
+        summary = endpoint_summary(_endpoint_report)
+        if summary["abnormal"]:
+            warn(f"端点体检异常 {summary['abnormal']}/{summary['total']}: {', '.join(summary['abnormal_urls'])} "
+                 f"(详情见 status.json / endpoints.json)")
+        os.makedirs(PUBLIC_DIR, exist_ok=True)
+        write_json(os.path.join(PUBLIC_DIR, "endpoints.json"), _endpoint_report)
 
     if not WORKER_URL_OK:
         return finish_degraded(
