@@ -48,17 +48,20 @@ for _stream in (sys.stdout, sys.stderr):
 
 
 def _env_csv(name, default):
-    """读取逗号分隔的环境变量; 未设置时使用 default。
+    """读取逗号分隔的环境变量, 返回「非空条目」列表 (list, 不是字符串); 未设置或为空时用 default。
 
-    default 允许是字符串或字符串序列 —— 这里必须做类型归一化:
-    旧版直接把元组 _DEFAULT_EDGE_HOSTS 传给 os.environ.get 的默认值, 结果
-    os.environ.get("EDGE_HOSTS", _DEFAULT_EDGE_HOSTS) 返回 tuple, 再 .split(",")
-    会在 import 阶段抛 AttributeError, 整轮运行 0 秒退出 1 (2026-10-06 那次失败就是这个原因)。
+    这里集中做两件容易出错的事, 调用方不再自己处理:
+      1) 类型归一化: default 允许是字符串或字符串序列。旧版直接把元组 _DEFAULT_EDGE_HOSTS
+         传给 os.environ.get 的默认值 → 返回 tuple → 再 .split(",") 会在 import 阶段抛
+         AttributeError, 整轮运行 0 秒退出 1 (2026-10-06 那次失败就是这个原因)。
+      2) 保证返回值是「条目列表」: 2026-10-07 的回归事故是调用方拿着字符串直接 for 遍历,
+         于是按「字符」拆成了 2447 个单字母入口, 生成的 nodes.txt 每行入口变成单个字母。
+         返回 list 之后, 任何调用方都不可能再忘记 split。
     """
     raw = os.environ.get(name)
-    if raw is None:
+    if raw is None or not str(raw).strip():
         raw = ",".join(default) if isinstance(default, (tuple, list)) else str(default)
-    return raw
+    return [item.strip() for item in str(raw).split(",") if item.strip()]
 
 # ---------------------------------------------------------------------------
 # 配置
@@ -73,7 +76,7 @@ VPNGATE_MIRROR = os.environ.get(
 # 数据源: 按顺序尝试, 全部失败才判定「数据源不可用」。格式 "csv:<url>" / "json:<url>", 也可直接写 URL。
 VPNGATE_SOURCES = [
     s.strip()
-    for s in _env_csv("VPNGATE_SOURCES", f"csv:{VPNGATE_API},json:{VPNGATE_MIRROR}").split(",")
+    for s in _env_csv("VPNGATE_SOURCES", f"csv:{VPNGATE_API},json:{VPNGATE_MIRROR}")
     if s.strip()
 ]
 FETCH_RETRIES = max(1, int(os.environ.get("FETCH_RETRIES", "3")))      # 单个数据源最多尝试次数
@@ -471,11 +474,7 @@ _DEFAULT_EDGE_HOSTS = (
     "img.856518.xyz:443,cfip-ct.stoeaves.us.ci:443,cf.777791.xyz:443,login.rockwellautomation.com:443,idc.urkeji.com:443,"
     "jellyfin.roddy.eu.cc:443,www.galgamex.net:443,kniu.cc:443,baota.us.kg:443,op.chinwa.eu.cc:443",
 )
-EDGE_HOSTS = [
-    h.strip()
-    for h in _env_csv("EDGE_HOSTS", _DEFAULT_EDGE_HOSTS).split(",")
-    if h.strip()
-]
+EDGE_HOSTS = _env_csv("EDGE_HOSTS", _DEFAULT_EDGE_HOSTS)
 
 NODES_URL = os.environ.get("NODES_URL", "https://200111226011qw-debug.github.io/gate/nodes.txt")
 # 上一版产物 (用于降级): data.json 默认与 nodes.txt 同目录
@@ -490,33 +489,23 @@ DATA_URL = os.environ.get("DATA_URL") or NODES_URL.rsplit("/", 1)[0] + "/data.js
 # 注意: 检测结果反映的是「运行本脚本的这台机器」的网络环境。
 # 若在 GitHub Actions (境外 runner) 上运行, 检测到的是境外视角,
 # 无法反映墙内污染 —— 此时信号1 通常不会命中, 不会误剔除。
-CN_DNS_LIST = [
-    s.strip()
-    for s in _env_csv("CN_DNS", "223.5.5.5,119.29.29.29,114.114.114.114").split(",")
-    if s.strip()
-]
+CN_DNS_LIST = _env_csv("CN_DNS", "223.5.5.5,119.29.29.29,114.114.114.114")
 EDGE_DNS_CHECK = os.environ.get("EDGE_DNS_CHECK", "1") not in ("0", "false", "False")
 
 # 黑名单: 已知无法作为 Cloudflare 优选入口的域名, 直接剔除, 不参与检测。
 #   www.bilibili.com —— 实测解析到 119.84.x / 183.131.x 等国内 IP, 不走 Cloudflare 网段。
 #   TCP 虽通, 但 TLS 无法路由到 Worker, 作为入口无效。
-EDGE_HOST_BLACKLIST = {
-    s.strip() for s in _env_csv("EDGE_HOST_BLACKLIST", "www.bilibili.com").split(",") if s.strip()
-}
+EDGE_HOST_BLACKLIST = set(_env_csv("EDGE_HOST_BLACKLIST", "www.bilibili.com"))
 # 白名单: 经检测确认「不走 CF 网段但确实可用」的入口, 跳过网段校验只测连通性。
 #   默认为空 —— 当前 20 个入口中仅 bilibili 异常, 已归入黑名单, 无需豁免。
 #   若日后新增 CNAME 类入口(解析不在 CF 段但 TLS 可达), 把域名填进来即可。
-EDGE_HOST_WHITELIST = {
-    s.strip() for s in _env_csv("EDGE_HOST_WHITELIST", "").split(",") if s.strip()
-}
+EDGE_HOST_WHITELIST = set(_env_csv("EDGE_HOST_WHITELIST", ""))
 # 锁定名单: 默认 = 默认入口池 (用户本地实测优选域名), 更新时「不动」——
 # 这些域名跳过 DNS 污染检测与 TCP 检测, 在自动更新中永远保留。
 # 若某个域名希望参与检测, 用 EDGE_HOST_LOCKED 环境变量传入不含它的列表即可。
-# 注意: 按「主机名」存储 (去掉 :端口), 与 filter_edge_hosts 里 _split_host_port 的比较口径一致;
-#       否则带端口的条目永远匹配不上去端口后的 host, 锁定形同虚设。
-EDGE_HOST_LOCKED = {
-    s.strip().split(":")[0] for s in _env_csv("EDGE_HOST_LOCKED", _DEFAULT_EDGE_HOSTS).split(",") if s.strip()
-}
+# 注意: 必须按「主机名」存 (去掉 :端口), 与 filter_edge_hosts 里 host in EDGE_HOST_LOCKED 的比较口径一致。
+#       否则带端口的条目永远匹配不上「去掉端口后的 host」, 锁定形同虚设 (2026-10-07 修)。
+EDGE_HOST_LOCKED = {entry.split(":")[0].strip() for entry in _env_csv("EDGE_HOST_LOCKED", _DEFAULT_EDGE_HOSTS)}
 EDGE_DNS_TIMEOUT = float(os.environ.get("EDGE_DNS_TIMEOUT", "5"))
 EDGE_TCP_TIMEOUT = float(os.environ.get("EDGE_TCP_TIMEOUT", "6"))
 
@@ -703,16 +692,23 @@ def filter_edge_hosts(entries):
 def build_nodes_text(data, edge_hosts=None):
     """生成纯节点行版本 (无注释): 每行 = 入口地址#名字$sstp://..."""
     countries = data["countries"]
-    _entry = os.environ.get("HOSTS_ENTRY", "").strip()
-    base = [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS
-    # DNS 污染过滤 (仅在未显式指定 HOSTS_ENTRY 时生效, 保证人工指定优先)
-    if not _entry:
-        base = filter_edge_hosts(base)
-    # 兜底: 极端情况下 (如黑名单清空列表) 回退到原始 EDGE_HOSTS, 避免除零/空轮换
-    if not base:
-        log("EDGE DNS", "警告: 筛选结果为空, 回退到完整入口列表")
-        base = list(EDGE_HOSTS)
-    edge = edge_hosts or base
+    if edge_hosts:
+        # 调用方显式给了入口列表 (测试/预览场景): 直接用, 不做黑名单与 DNS 检测
+        edge = list(edge_hosts)
+    else:
+        _entry = os.environ.get("HOSTS_ENTRY", "").strip()
+        base = [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS
+        # DNS 污染过滤 (仅在未显式指定 HOSTS_ENTRY 时生效, 保证人工指定优先)
+        if not _entry:
+            base = filter_edge_hosts(base)
+        # 兜底: 极端情况下 (如黑名单清空列表) 回退到原始 EDGE_HOSTS, 避免除零/空轮换
+        if not base:
+            log("EDGE DNS", "警告: 筛选结果为空, 回退到完整入口列表")
+            base = list(EDGE_HOSTS)
+        edge = base
+    if not edge:
+        log("EDGE DNS", "警告: 入口池为空, 无法生成任何节点行")
+        return ""
     lines = []
     idx = 0
     ordered = sorted(countries.items(), key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])))
@@ -748,8 +744,8 @@ def write_json(path, obj):
     return path
 
 
-def write_outputs(data, status):
-    """正常路径: 写入本轮新生成的产物。"""
+def write_outputs(data, status, nodes_text):
+    """正常路径: 写入本轮新生成的产物 (nodes_text 由调用方生成并校验非空)。"""
     os.makedirs(PUBLIC_DIR, exist_ok=True)
     data["status"] = status
     data_path = write_json(os.path.join(PUBLIC_DIR, "data.json"), data)
@@ -758,9 +754,36 @@ def write_outputs(data, status):
         f.write(render_html())
     nodes_path = os.path.join(PUBLIC_DIR, "nodes.txt")
     with open(nodes_path, "w", encoding="utf-8") as f:
-        f.write(build_nodes_text(data))
+        f.write(nodes_text)
     status_path = write_json(os.path.join(PUBLIC_DIR, STATUS_NAME), status)
     return data_path, html_path, nodes_path, status_path
+
+
+# 节点行格式: 入口[#名字]$sstp://vpn:vpn@主机:端口   (入口与主机都必须是域名)
+NODE_LINE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(?::\d+)?#[^$]+\$sstp://vpn:vpn@[A-Za-z0-9][A-Za-z0-9._-]*:\d+$")
+
+
+def validate_nodes_text(text):
+    """自检产物格式: 返回问题列表 (空列表 = 每行都合法)。
+
+    加这道自检是因为 2026-10-07 的事故: 入口池被按「字符」拆开, 生成的每行入口变成
+    单个字母, 而当时的测试只数了行数, 没校验格式 —— 于是「测试全绿、产物全废」。
+    """
+    problems = []
+    lines = [ln for ln in (text or "").splitlines() if ln.strip()]
+    if not lines:
+        return ["nodes.txt 为空"]
+    for i, ln in enumerate(lines, 1):
+        if not NODE_LINE_RE.match(ln):
+            problems.append(f"第 {i} 行格式非法: {ln[:80]}")
+            continue
+        entry = ln.split("#", 1)[0].split(":")[0]
+        if "." not in entry:
+            problems.append(f"第 {i} 行入口不是域名: {entry!r}")
+        host = ln.rsplit("@", 1)[-1].split(":")[0]
+        if "." not in host:
+            problems.append(f"第 {i} 行节点主机不是域名: {host!r}")
+    return problems
 
 
 # ---------------------------------------------------------------------------
@@ -914,6 +937,13 @@ def main():
             started,
         )
 
+    if not EDGE_HOSTS and not os.environ.get("HOSTS_ENTRY", "").strip():
+        return finish_degraded(
+            session,
+            "入口池为空 (EDGE_HOSTS 与默认池都没有条目), 生成的订阅会是空的 — 不发布",
+            started,
+        )
+
     rows, source = fetch_vpngate(session)
     if not rows:
         return finish_degraded(session, "所有数据源都不可用 (官方 API 与 GitHub 镜像均获取失败)", started)
@@ -976,6 +1006,12 @@ def main():
             return finish_degraded(session, reason, started, last_good=last_good, source=source, **stats)
 
     data = build_outputs(results, raw_count, sstp_count, source)
+    nodes_text = build_nodes_text(data)
+    format_problems = validate_nodes_text(nodes_text)
+    if format_problems:
+        reason = "生成的节点行未通过格式自检, 不发布 (可能是入口池配置异常): " + "; ".join(format_problems[:3])
+        return finish_degraded(session, reason, started, source=source, **stats)
+
     status = build_status(
         "fresh",
         f"正常更新 (检测服务异常 {len(worker_errors)} 次)" if worker_errors else "正常更新",
@@ -984,7 +1020,7 @@ def main():
         stats=data["stats"],
         worker_errors=len(worker_errors),
     )
-    paths = write_outputs(data, status)
+    paths = write_outputs(data, status, nodes_text)
 
     log("RESULT", f"可用节点: {len(success)}")
     log("RESULT", f"国家数量: {data['stats']['countries']}")
