@@ -515,7 +515,7 @@ _DEFAULT_EDGE_HOSTS = (
     "academy.7shifts.com:443,www.akasantech.com:443,www.wuduanyun.com:443,fn.130519.xyz:443,guide.for.edu.sg:443,"
     "mail.notion.com:443,www.xiaoshuofen.com:443,www.gov.il:443,thebeat.gehealthcare.com:443,jobsdb.com:443,www.leics.police.uk:443,"
     "prizepicks.com:443,constitution.congress.gov:443,tt.78607323.xyz:443,www.carousell.sg:443,ikankeji.com:443,www.wto.org:443,"
-    "cmcc.cc.cd:443,cdn.204910.best:443,cf.qq.ms:443,egov.uscis.gov:443,www.zendesk.com:443,img.css.sd:443,www.blibli.com:443,"
+    "cdn.204910.best:443,cf.qq.ms:443,egov.uscis.gov:443,www.zendesk.com:443,img.css.sd:443,www.blibli.com:443,"
     "cf.nyanya.moe:443,auto.dolby.dpdns.org:443,cdn.jwcmdr.top:443,224322.xyz:443,www.jp.pima.gov:443,cf.92555.xyz:443,"
     "cf.254301.xyz:443,01-cctv.com:443,stores.staples.com:443,cdn.555586.xyz:443,www.5h.com:443,lt.1930812.xyz:443,www.bis.gov:443,"
     "cf.yj250.bond:443,test.509666.xyz:443,www.sage.com:443,01-qq.com:443,www.crazygames.fr:443,so.360832.xyz:443,"
@@ -941,7 +941,7 @@ def write_outputs(data, status, nodes_text):
 
 
 # 节点行格式: 入口[#名字]$sstp://vpn:vpn@主机:端口   (入口与主机都必须是域名)
-NODE_LINE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(?::\d+)?#[^$]+\$sstp://vpn:vpn@[A-Za-z0-9][A-Za-z0-9._-]*:\d+$")
+NODE_LINE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:\:\d+)?#[^$]+\$sstp://vpn:vpn@[A-Za-z0-9][A-Za-z0-9._-]*:\d+$")
 
 
 def validate_nodes_text(text):
