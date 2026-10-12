@@ -115,7 +115,7 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 
 ### 在哪个文件改
 - 文件：`vpngate.py`
-- 位置：`_DEFAULT_EDGE_HOSTS`（当前 125 个，bestcf 三批实测结果合并去重）
+- 位置：`_DEFAULT_EDGE_HOSTS`（当前 124 个，bestcf 三批实测结果合并去重）
 
 ### 改法（两种，任选其一）
 1. **改常量**（推荐）：打开 `vpngate.py`，把 `_DEFAULT_EDGE_HOSTS` 里的域名列表换成你测出来的（逗号分隔，格式 `域名:443`），提交推送，等下一次自动运行或手动触发 Action。
@@ -160,7 +160,7 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 
 | 名称 | 默认值 | 说明 |
 | :--- | :--- | :--- |
-| `_DEFAULT_EDGE_HOSTS` | 125 个实测域名 | 入口优选域名池（换域名改这里） |
+| `_DEFAULT_EDGE_HOSTS` | 124 个实测域名 | 入口优选域名池（换域名改这里） |
 | `EDGE_HOSTS` | = 默认池 | 覆盖入口池（环境变量） |
 | `EDGE_HOST_LOCKED` | = 默认池 | 锁定名单：**按主机名存**（不带 `:端口`），不参与 DNS/TCP 检测，更新时不动 |
 | `OPTIMAL_API` | 电信/联通/移动 3 个接口 | 内置自动优选接口地址，英文逗号分隔；设 `off` 关闭（见第四节） |
@@ -245,6 +245,7 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 
 | 日期 | 版本 | 变更 |
 | :--- | :--- | :--- |
+| 2026-10-12 | v1.5.1 | **配置修正**：本地实测 125 个静态优选域名（TCP 443 + `/cdn-cgi/trace` 双检），剔除 DNS 失效的 `cmcc.cc.cd:443`，入口池 125 → 124 个 |
 | 2026-10-12 | v1.5.0 | **行为变更（minor）**：新增 `OPTIMAL_API` 内置自动优选 —— 每轮运行从优选接口现取优选 IP 置于入口池首，支持 `off`/`0`/`none`/`false` 关闭；`filter_edge_hosts` 新增裸 IP 分支（只做 TCP 检测，不参与 DNS 污染判定）；`data.json` 新增 `optimal_api` 字段；`tests/run_tests.py` 回归环境设 `OPTIMAL_API=off` 保证离线可复现 |
 
 ---
