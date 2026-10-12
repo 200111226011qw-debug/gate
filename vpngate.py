@@ -527,6 +527,32 @@ _DEFAULT_EDGE_HOSTS = (
 )
 EDGE_HOSTS = _env_csv("EDGE_HOSTS", _DEFAULT_EDGE_HOSTS)
 
+# ---------------------------------------------------------------------------
+# 内置自动优选 API (告别手动优选)
+# ---------------------------------------------------------------------------
+# 背景: 静态 EDGE_HOSTS 是「一次性测速、永远不变」的域名池, 优选 IP 会随时间劣化,
+# 需要人肉重测才能换 —— 这正是 edgetunnel 面板「自定义优选IP」长期要手工维护的痛点。
+# 这里每轮运行都去优选 API 现取一批当轮最优 IP, 放在池首优先使用, 静态域名降为兜底。
+#
+# API 响应格式: text/plain, 每行 "IP#名字" 或裸 "IP", **不带端口** (port 只是查询参数),
+# 所以必须由本模块补 ":443" —— 直接把返回行塞进 nodes.txt 会过不了 validate_nodes_text。
+#
+# 支持多个接口 (英文逗号分隔), 逐个尝试; 任何一个失败都不影响其余, 全部失败则纯用静态池。
+# 想关掉这个功能: OPTIMAL_API=off (或 0 / none / false)。
+_DEFAULT_OPTIMAL_API = (
+    "https://cf.090227.xyz/ct?ips=6&port=443,"     # 电信
+    "https://cf.090227.xyz/cu?port=443,"           # 联通
+    "https://cf.090227.xyz/cmcc?ips=8&port=443",   # 移动
+)
+_opt_raw = os.environ.get("OPTIMAL_API")
+OPTIMAL_API = (
+    [] if (_opt_raw is not None and _opt_raw.strip().lower() in ("0", "off", "none", "false", "disable"))
+    else _env_csv("OPTIMAL_API", _DEFAULT_OPTIMAL_API)
+)
+OPTIMAL_TIMEOUT = float(os.environ.get("OPTIMAL_TIMEOUT", "20"))   # 单个优选接口超时(秒)
+OPTIMAL_MAX = max(1, int(os.environ.get("OPTIMAL_MAX", "24")))     # 单轮最多采纳多少个优选 IP
+OPTIMAL_HEADERS = {"User-Agent": "gate-vpngate/1.0 (+auto-optimal)"}
+
 NODES_URL = os.environ.get("NODES_URL", "https://200111226011qw-debug.github.io/gate/nodes.txt")
 # 上一版产物 (用于降级): data.json 默认与 nodes.txt 同目录
 DATA_URL = os.environ.get("DATA_URL") or NODES_URL.rsplit("/", 1)[0] + "/data.json"
@@ -656,6 +682,90 @@ def _tcp_ok(host, port=443, timeout=EDGE_TCP_TIMEOUT):
         return False
 
 
+# 优选 API 返回的入口既可能是裸 IP 也可能是域名, 两种都要认
+_IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*$")
+
+
+def _is_ip_literal(host):
+    """入口是不是裸 IP (优选 API 的产物)。裸 IP 没有 DNS 记录可查, 检测逻辑必须区别对待。"""
+    return bool(_IPV4_RE.match(host))
+
+
+def _normalize_optimal_line(line):
+    """把优选 API 的一行解析成 'host:port' 条目; 无法识别返回 None。
+
+    实测该 API 返回 "104.18.33.230#CF 电信优选" —— 裸 IP + '#名字', 且**不带端口**
+    (port 只是查询参数), 所以这里默认补 443; 若行里已带 ':端口' 则沿用。
+    同时容忍 'https://1.2.3.4/path?x=1' 这种整行 URL 形态。
+
+    裸 IPv6 (含多个 ':' 且无方括号) 会被 _split_host_port 误拆成 host/port, 这里直接判为
+    不采用 —— 上述接口目前只返 IPv4, 真要支持得先给 _split_host_port 补方括号解析。
+    """
+    line = line.split("#", 1)[0].strip()
+    if "://" in line:
+        line = line.split("://", 1)[1]
+    line = line.split("/")[0].split("?")[0].strip()
+    if not line or (":" in line and line.count(":") > 1):
+        return None
+    host, port = _split_host_port(line)
+    if not _IPV4_RE.match(host) and not _HOSTNAME_RE.match(host):
+        return None
+    return f"{host}:{port or 443}"
+
+
+def _dedupe_entries(entries):
+    """按原顺序去重入口条目 (保留首次出现), 空条目丢弃。"""
+    seen, out = set(), []
+    for entry in entries:
+        entry = entry.strip()
+        if entry and entry not in seen:
+            seen.add(entry)
+            out.append(entry)
+    return out
+
+
+def fetch_optimal_hosts(session, limit=None):
+    """按 OPTIMAL_API 逐个拉取当轮优选 IP, 返回 'host:port' 列表 (顺序保留, 已去重)。
+
+    任何一个接口失败都只告警不中断; 全部失败返回 [] —— 调用方据此纯用静态 EDGE_HOSTS,
+    绝不因为优选服务抽风就产出空订阅 (这条与 DNS 污染检测的兜底策略一致)。
+    """
+    if not OPTIMAL_API:
+        log("OPTIMAL", "已用 OPTIMAL_API=off 关闭自动优选, 本轮只用静态入口池")
+        return []
+
+    cap = OPTIMAL_MAX if limit is None else max(1, limit)
+    out, seen, failed = [], set(), 0
+    for url in OPTIMAL_API:
+        if len(out) >= cap:
+            break
+        try:
+            resp = session.get(url, timeout=OPTIMAL_TIMEOUT, headers=OPTIMAL_HEADERS)
+            resp.raise_for_status()
+        except Exception as exc:
+            failed += 1
+            warn(f"OPTIMAL: 优选接口不可用 ({type(exc).__name__}: {exc}) -> {url}")
+            continue
+        got = 0
+        for raw_line in (getattr(resp, "text", "") or "").splitlines():
+            entry = _normalize_optimal_line(raw_line)
+            if not entry or entry in seen:
+                continue
+            seen.add(entry)
+            out.append(entry)
+            got += 1
+            if len(out) >= cap:
+                break
+        log("OPTIMAL", f"{url} -> 采纳 {got} 个")
+
+    if not out:
+        warn("OPTIMAL: 所有优选接口都没返回可用 IP, 本轮沿用静态入口池 (不影响 nodes.txt 产出)")
+    else:
+        log("OPTIMAL", f"合计采纳 {len(out)} / 上限 {cap} 个优选 IP (接口失败 {failed} 个)")
+    return out[:cap]
+
+
 def filter_edge_hosts(entries):
     """剔除黑名单域名, 以及被 DNS 污染或 TCP 不通的入口域名。全部不可用时保留原列表。"""
     if not entries:
@@ -687,6 +797,18 @@ def filter_edge_hosts(entries):
         if host in EDGE_HOST_LOCKED:
             log("EDGE DNS", f"  [LOCK] {host:<24} 锁定, 更新时不动")
             checked.append(rec)
+            continue
+        # 第 0.5 步: 优选 API 给的是裸 IP 入口, 没有 DNS 记录可解析, 只测 TCP 连通性。
+        # 必须在这里分叉: 若让它走下面的 DNS 分支, _dns_query_a("104.18.33.230") 查不到
+        # A 记录, 会被 100% 误判成「国内 DNS 无 A 记录」而全量剔除, 自动优选就白做了。
+        if _is_ip_literal(host):
+            rec["ips"] = [host]
+            if not _tcp_ok(host, port):
+                rec["status"] = "bad"
+                rec["reasons"].append("TCP 连接失败")
+            checked.append(rec)
+            detail = "优选裸IP, TCP 可达" if rec["status"] == "ok" else "; ".join(rec["reasons"])
+            log("EDGE DNS", f"  [{rec['status'].upper():<5}] {host:<24} {detail}")
             continue
         try:
             for server in CN_DNS_LIST:
@@ -740,8 +862,11 @@ def filter_edge_hosts(entries):
     return healthy_entries
 
 
-def build_nodes_text(data, edge_hosts=None):
-    """生成纯节点行版本 (无注释): 每行 = 入口地址#名字$sstp://..."""
+def build_nodes_text(data, edge_hosts=None, optimal_hosts=None):
+    """生成纯节点行版本 (无注释): 每行 = 入口地址#名字$sstp://...
+
+    optimal_hosts: 本轮优选 API 现取的裸 IP 入口, 置于入口池首优先使用; 传 None 则只用静态池。
+    """
     countries = data["countries"]
     if edge_hosts:
         # 调用方显式给了入口列表 (测试/预览场景): 直接用, 不做黑名单与 DNS 检测
@@ -751,6 +876,11 @@ def build_nodes_text(data, edge_hosts=None):
         base = [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS
         # DNS 污染过滤 (仅在未显式指定 HOSTS_ENTRY 时生效, 保证人工指定优先)
         if not _entry:
+            # 自动优选 IP 必须排池首: 下面按 edge[idx % len(edge)] 顺序轮换, 而静态池有上百条、
+            # 实际可用节点只有几十条, 轮得到的基本只有池首那一段 —— 不排首位就等于没启用。
+            if optimal_hosts:
+                log("EDGE", f"自动优选 {len(optimal_hosts)} 个 IP 置于入口池首, 静态域名降为兜底")
+                base = _dedupe_entries(list(optimal_hosts) + base)
             base = filter_edge_hosts(base)
         # 兜底: 极端情况下 (如黑名单清空列表) 回退到原始 EDGE_HOSTS, 避免除零/空轮换
         if not base:
@@ -1073,7 +1203,15 @@ def main():
             return finish_degraded(session, reason, started, last_good=last_good, source=source, **stats)
 
     data = build_outputs(results, raw_count, sstp_count, source)
-    nodes_text = build_nodes_text(data)
+    # 自动优选: 在生成节点行之前现取当轮优选 IP。超时/接口挂了会自动退回静态池
+    # (见 fetch_optimal_hosts), 这一步永远不阻断发布 —— 优选服务抽风不该让整轮流水线失败。
+    optimal_hosts = fetch_optimal_hosts(session)
+    data["optimal_api"] = {
+        "count": len(optimal_hosts),
+        "hosts": optimal_hosts,
+        "sources": list(OPTIMAL_API),
+    }
+    nodes_text = build_nodes_text(data, optimal_hosts=optimal_hosts)
     format_problems = validate_nodes_text(nodes_text)
     if format_problems:
         reason = "生成的节点行未通过格式自检, 不发布 (可能是入口池配置异常): " + "; ".join(format_problems[:3])

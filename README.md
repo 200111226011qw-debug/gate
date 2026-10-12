@@ -121,16 +121,6 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 1. **改常量**（推荐）：打开 `vpngate.py`，把 `_DEFAULT_EDGE_HOSTS` 里的域名列表换成你测出来的（逗号分隔，格式 `域名:443`），提交推送，等下一次自动运行或手动触发 Action。
 2. **用环境变量覆盖**（不动代码）：在 `.github/workflows/check.yml` 主步骤的 `env:` 里加一行 `EDGE_HOSTS: "a.com:443,b.com:443"`。
 
-### 自动优选（OPTIMAL_API，v1.5.0 新增）
-除了静态域名池，还可以让**每次运行自动从优选接口拉取优选 IP**，排到入口池最前（客户端优先连这些 IP）——告别手动优选：
-- 配置：`vpngate.py` 里的 `OPTIMAL_API`（支持多个，英文逗号分隔；未设置时用默认电信线路）
-- 默认值（教程示例，可按自己线路换成联通/移动接口）：
-  - 电信：`https://cf.090227.xyz/ct?ips=6&port=443`
-  - 联通：`https://cf.090227.xyz/cu?port=443`
-  - 移动：`https://cf.090227.xyz/cmcc?ips=8&port=443`
-- 行为：每次运行先拉优选 IP（格式 `IP#名称`，无端口时按接口 `port` 参数补齐）；接口失败/返回为空时**自动降级沿用静态入口池**，绝不影响发布。
-- 运行结果在 `status.json` 的 `optimal_hosts` 字段可见。
-
 ### 关于「锁定」（更新时不动）
 `EDGE_HOST_LOCKED` 默认等于 `_DEFAULT_EDGE_HOSTS`：**锁定名单里的域名在自动更新中永远保留** —— 跳过 DNS 污染检测与 TCP 连通性检测。
 
@@ -139,14 +129,43 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 
 ---
 
-## 四、配置速查表（vpngate.py / workflow env）
+## 四、内置自动优选 API（不用再手动测优选）
+
+静态优选域名池有个硬伤：它是**一次性测速、永远不变**的，IP 质量会随时间劣化，要换就得人肉重测、再提交一次。
+
+现在 `vpngate.py` 每轮运行都会去「优选 API」现取一批当轮最优 IP，放在入口池**最前面**优先轮换，静态域名降级为兜底。
+
+### 配置项
+
+| 名称 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `OPTIMAL_API` | 电信 / 联通 / 移动三条线路 | 优选接口地址，英文逗号分隔可写多个；设 `off`（或 `0` / `none` / `false`）关闭 |
+| `OPTIMAL_MAX` | `24` | 单轮最多采纳多少个优选 IP |
+| `OPTIMAL_TIMEOUT` | `20` | 单个优选接口超时（秒） |
+
+### 行为要点
+
+- **接口格式**：响应是纯文本，每行 `IP#名字`，**不带端口**（`port` 只是查询参数），脚本自动补 `:443`。
+- **失败不阻断发布**：任何一个接口超时/报错只告警；**全部失败则本轮纯用静态入口池**，绝不产出空订阅。
+- **裸 IP 只测连通性**：优选 IP 没有 DNS 记录可查，因此只做 TCP 可达性测试，不参与 DNS 污染判定 —— 否则会被 100% 误判成「无 A 记录」而全量剔除。
+- **本轮结果写进 `data.json`** 的 `optimal_api` 字段（数量 / 具体 IP / 用了哪些接口），方便排查「到底换没换」。
+- **换线路**：改 `vpngate.py` 里的 `_DEFAULT_OPTIMAL_API`，或在 workflow `env` 里传 `OPTIMAL_API`。
+
+> 优选 IP 来自第三方接口，采纳其结果等于信任该服务。它只影响「入口地址」，
+> 不接触你的订阅内容、UUID 或 Cloudflare 凭据 —— 但如果介意，把它设成 `OPTIMAL_API=off` 即可完全回到纯静态池。
+
+---
+
+## 五、配置速查表（vpngate.py / workflow env）
 
 | 名称 | 默认值 | 说明 |
 | :--- | :--- | :--- |
 | `_DEFAULT_EDGE_HOSTS` | 125 个实测域名 | 入口优选域名池（换域名改这里） |
 | `EDGE_HOSTS` | = 默认池 | 覆盖入口池（环境变量） |
 | `EDGE_HOST_LOCKED` | = 默认池 | 锁定名单：**按主机名存**（不带 `:端口`），不参与 DNS/TCP 检测，更新时不动 |
-| `OPTIMAL_API` | 电信优选接口 | 自动优选 API（逗号分隔多地址），每次运行拉取优选 IP 排入口池最前；失败自动沿用静态池 |
+| `OPTIMAL_API` | 电信/联通/移动 3 个接口 | 内置自动优选接口地址，英文逗号分隔；设 `off` 关闭（见第四节） |
+| `OPTIMAL_MAX` | `24` | 单轮最多采纳多少个优选 IP |
+| `OPTIMAL_TIMEOUT` | `20` | 单个优选接口超时（秒） |
 | `CHECK_WORKER` | 无（必填） | 检测 Worker，形如 `https://xxx/check?sstp=vpn:vpn@`（Actions 里来自 `secrets.DOMAIN`） |
 | `CHECK_CONCURRENCY` | `4` | 检测并发。**不要调大**：Worker 上游有免费额度，32 并发会大面积 429 |
 | `CHECK_TIMEOUT` | `60` | 单次检测超时（秒） |
@@ -162,7 +181,7 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 
 ---
 
-## 五、自动更新的健壮性设计（为什么不会再「整轮挂掉」）
+## 六、自动更新的健壮性设计（为什么不会再「整轮挂掉」）
 
 每次运行都会在 `public/status.json`（同时发布到 Pages）写下结论：
 
@@ -186,7 +205,7 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 
 ---
 
-## 六、常见问题
+## 七、常见问题
 
 ### 只有几个节点能连
 入口优选域名大部分被墙。用 bestcf 重新测速，把 `_DEFAULT_EDGE_HOSTS` 换成实测能通的域名。
@@ -226,7 +245,7 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 
 | 日期 | 版本 | 变更 |
 | :--- | :--- | :--- |
-| 2026-10-12 | v1.5.0 | **行为变更（minor）**：新增 `OPTIMAL_API` 自动优选功能 —— 每次运行从优选接口拉取优选 IP 排入口池最前，接口失败自动降级沿用静态池；`status.json` 新增 `optimal_hosts` 字段；`log_diagnostics` 新增自动优选诊断行 |
+| 2026-10-12 | v1.5.0 | **行为变更（minor）**：新增 `OPTIMAL_API` 内置自动优选 —— 每轮运行从优选接口现取优选 IP 置于入口池首，支持 `off`/`0`/`none`/`false` 关闭；`filter_edge_hosts` 新增裸 IP 分支（只做 TCP 检测，不参与 DNS 污染判定）；`data.json` 新增 `optimal_api` 字段；`tests/run_tests.py` 回归环境设 `OPTIMAL_API=off` 保证离线可复现 |
 
 ---
 

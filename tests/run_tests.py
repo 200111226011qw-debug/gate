@@ -61,6 +61,8 @@ BASE_ENV = {
     "EDGE_HOST_LOCKED": "entry-a.example:443,entry-b.example:443,entry-c.example:443",
     "NODES_URL": "https://last.good/gate/nodes.txt",
     "DATA_URL": "https://last.good/gate/data.json",
+    # 关闭内置自动优选: 回归必须全程离线可复现, 且入口池固定才能比对产物
+    "OPTIMAL_API": "off",
     "FAKE_NODES": "12",
     "FAKE_DELAY": "0.001",
     "PYTHONIOENCODING": "utf-8",
