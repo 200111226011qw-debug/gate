@@ -941,7 +941,7 @@ def write_outputs(data, status, nodes_text):
 
 
 # 节点行格式: 入口[#名字]$sstp://vpn:vpn@主机:端口   (入口与主机都必须是域名)
-NODE_LINE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(?:\:\d+)?#[^$]+\$sstp://vpn:vpn@[A-Za-z0-9][A-Za-z0-9._-]*:\d+$")
+NODE_LINE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(?::\d+)?#[^$]+\$sstp://vpn:vpn@[A-Za-z0-9][A-Za-z0-9._-]*:\d+$")
 
 
 def validate_nodes_text(text):
