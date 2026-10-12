@@ -121,6 +121,13 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 1. **改常量**（推荐）：打开 `vpngate.py`，把 `_DEFAULT_EDGE_HOSTS` 里的域名列表换成你测出来的（逗号分隔，格式 `域名:443`），提交推送，等下一次自动运行或手动触发 Action。
 2. **用环境变量覆盖**（不动代码）：在 `.github/workflows/check.yml` 主步骤的 `env:` 里加一行 `EDGE_HOSTS: "a.com:443,b.com:443"`。
 
+### 本地测速工具（BestCF）
+本地测优选域名推荐用 BestCF 在线工具：`https://bestcf.fxxk.dedyn.io/`（纯前端，打开即用）。
+
+- **判断可用**的双检逻辑：① TCP 443 握手能通；② 请求 `https://域名/cdn-cgi/trace` 返回含 `ip=` 行
+- 只支持 Cloudflare 官方 CDN 域名；测出的域名按 `域名:443` 逗号分隔填入 `_DEFAULT_EDGE_HOSTS`（或 `EDGE_HOSTS`）
+- 2026-10-12 的 125→124 入口池清理就是用这套逻辑实测的（唯一失效：`cmcc.cc.cd` DNS 解析失败）
+
 ### 关于「锁定」（更新时不动）
 `EDGE_HOST_LOCKED` 默认等于 `_DEFAULT_EDGE_HOSTS`：**锁定名单里的域名在自动更新中永远保留** —— 跳过 DNS 污染检测与 TCP 连通性检测。
 
