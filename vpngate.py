@@ -168,10 +168,13 @@ _section = None
 def log(section, msg=""):
     global _section
     if section != _section:
-        print(f"========== {section} ==========")
+        print(f"========== {section} ==========", flush=True)
         _section = section
     if msg:
-        print(msg, flush=True)
+        # 消息行带时间戳: 这样才能把 duration_s - elapsed (即 check_all 之外的所有步骤)
+        # 拆到具体阶段 —— 数据源抓取 / 下载上一版产物 / 优选 API / 入口池检测 / 写产物。
+        # 段头不加时间戳, 保持日志密度不变。不需要改任何现有调用。
+        print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 def warn(msg):
     """非致命问题: 打印告警并生成 GitHub Actions 注解 (运行页可见)。"""
