@@ -73,6 +73,14 @@ def _nodes():
         # FAKE_SAME_PORT: 让所有节点共用一个端口, 用于复现「整个端口被目标侧限流」的场景
         # (生产环境 2026-10-21 实测: :443 端口 100% 返回 429)
         port = int(os.environ["FAKE_SAME_PORT"]) if os.environ.get("FAKE_SAME_PORT") else 443 + i
+        # FAKE_MIX_LASTGOOD: 前 N 个节点复用「上一版已发布」的主机名, 用于验证
+        # PREFER_NEW_NODES (检测额度优先给新节点) —— 没有它就无法区分已知/新节点
+        if os.environ.get("FAKE_MIX_LASTGOOD"):
+            try:
+                if i < int(os.environ["FAKE_MIX_LASTGOOD"]):
+                    host = f"vpn{900000000 + i + 1}"
+            except ValueError:
+                pass
         out.append({
             "hostname": host,
             "ip": f"10.0.{i // 250}.{i % 250}",

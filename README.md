@@ -214,7 +214,7 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 6. **发布前产物自检**：`validate_nodes_text()` 逐行校验 `nodes.txt`（入口与节点主机必须是域名），格式不合格就**拒绝发布**并降级沿用上一版 —— 防止「运行绿色但订阅是坏的」（2026-10-07 踩过这个坑：入口池被按字符拆开，每行入口变成单个字母，而当时测试只数行数）。
 7. **入口池解析**：`_env_csv()` 统一读取「逗号分隔」配置，**返回条目列表**，调用方不需要（也无法忘记）`.split(",")`。
 
-> 想本地验证这些行为（无需联网）：`python tests/run_tests.py`（13 组故障场景）。
+> 想本地验证这些行为（无需联网）：`python tests/run_tests.py`（15 组故障场景）。
 > 沙箱环境若因批量删除被拦，换一个空的运行目录即可：`TEST_RUNS_DIR=tests/runs_v2 python tests/run_tests.py`。
 
 ---
@@ -244,8 +244,15 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 
 > **怎么看本轮到底发生了什么**：直接看 `status.json` 的 `failure_breakdown`
 > （`target_ratelimit` / `worker_error` / `node_dead` 三类分别多少个）、
-> `rate_limited_ports`（被熔断的端口）、`new_nodes`（本轮新增可用节点数）。
+> `rate_limited_ports`（被熔断的端口）、`rate_limited_ports_detail`（每个被熔断端口的
+> 候选总数 / 真撞 429 数 / 跳过数）、`new_nodes`（本轮新增可用节点数）。
 > 三类之和恒等于失败总数 —— 不对就是脚本的归因出 bug 了，日志里会有「失败归因计数不自洽」告警。
+>
+> ⚠️ **读 `failure_breakdown` 时别重复计数**：被端口熔断跳过的节点 `failure_kind` 也是
+> `target_ratelimit`（它是「未测」不是「不通」），所以
+> **`target_ratelimit` = 真撞 429 的数量 + 熔断跳过的数量**，两者是包含关系、不能相加。
+> 想看「实际发出了多少次请求并撞到 429」，读 `target_ratelimit_probed`。
+> 同理 `rate_limited_ports_detail.443.skipped` 是 `target_ratelimit` 的一部分，不是额外的一拨。
 
 ### 关于「429 限流」与「节点不通」的区别（重要）
 两者都会被检测 Worker 判成 `success=false`，但含义完全不同：
@@ -279,6 +286,7 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 
 | 日期 | 版本 | 变更 |
 | :--- | :--- | :--- |
+| 2026-10-21 | v1.6.1 | **修复 `PREFER_NEW_NODES` 排序键写反**（写成「老节点优先」，与语义相反；`CHECK_BUDGET=0` 时不触发故一直未暴露）；`status.json` 增加 `target_ratelimit_probed`（真撞 429 次数）与 `rate_limited_ports_detail`（被熔断端口的候选/撞限流/跳过数），以区分「限流 14」中的包含关系、便于判断是否过度误杀；测试新增 `worker_http403`、`budget_new_first` 两场景 |
 | 2026-10-21 | v1.6.0 | **修复「抓不到新节点」**：失败三级归因（`target_ratelimit`/`worker_error`/`node_dead`），429 默认不重试；新增按端口自适应熔断（`PORT_CB_THRESHOLD`）+ 全局滑窗退避（`GLOBAL_RL_*`）；新增检测预算 `CHECK_BUDGET` 与「新节点/住宅型优先」（`PREFER_NEW_NODES`）；`status.json` 增加 `failure_breakdown`/`rate_limited_ports`/`new_nodes`；修复降级分支不写 `status.json` 的 bug（`failed` 时产物缺失导致误判「脚本没跑」）；测试新增 `port_cb`、`rl_breakdown` 两场景 |
 | 2026-10-12 | v1.5.1 | **配置修正**：本地实测 125 个静态优选域名（TCP 443 + `/cdn-cgi/trace` 双检），剔除 DNS 失效的 `cmcc.cc.cd:443`，入口池 125 → 124 个 |
 | 2026-10-12 | v1.5.0 | **行为变更（minor）**：新增 `OPTIMAL_API` 内置自动优选 —— 每轮运行从优选接口现取优选 IP 置于入口池首，支持 `off`/`0`/`none`/`false` 关闭；`filter_edge_hosts` 新增裸 IP 分支（只做 TCP 检测，不参与 DNS 污染判定）；`data.json` 新增 `optimal_api` 字段；`tests/run_tests.py` 回归环境设 `OPTIMAL_API=off` 保证离线可复现 |

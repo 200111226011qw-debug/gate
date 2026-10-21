@@ -638,8 +638,11 @@ def select_check_targets(nodes, known_keys=None, budget=0):
     ordered = list(nodes)
     if PREFER_NEW_NODES and known_keys:
         kind_rank = {"residential": 0, "unknown": 1, "datacenter": 2}
+        # 新节点优先: 不在 known_keys 里的取 0 (排前面), 已知的取 1 (排后面)。
+        # 注意别写反 —— 写成 `0 if in known_keys else 1` 会变成「老节点优先」,
+        # 与 PREFER_NEW_NODES 的语义完全相反, 且 CHECK_BUDGET=0 时不会暴露。
         ordered.sort(key=lambda n: (
-            0 if (n["host"].lower(), n["port"]) in known_keys else 1,
+            0 if (n["host"].lower(), n["port"]) not in known_keys else 1,
             kind_rank.get(classify_network(n["host"], ""), 1),
             n["host"],
         ))
@@ -1488,11 +1491,30 @@ def main():
             results = results + carried
             success = [r for r in results if r.get("success")]
 
+    # 注意含关系: 被熔断跳过的节点 failure_kind 也是 target_ratelimit (它是「未测」不是「不通」),
+    # 所以 target_ratelimit = 真撞 429 的数量 + 熔断跳过的数量。两个数字不并列、不能相加。
+    probed_rl = [r for r in rate_limited if not r.get("skipped_by_breaker")]
+    # 每个被熔断端口的候选总数: 没有它就无法判断「跳过 7 个」是正常熔断还是整段砍掉
+    port_candidates = {}
+    for n in selected:
+        port_candidates[n["port"]] = port_candidates.get(n["port"], 0) + 1
+    port_detail = {}
+    for p in tripped:
+        port_detail[str(p)] = {
+            "candidates": port_candidates.get(p, 0),
+            "probed_429": sum(1 for r in probed_rl if r.get("port") == p),
+            "skipped": sum(1 for r in failed if r.get("skipped_by_breaker") and r.get("port") == p),
+        }
+
     breakdown = {"target_ratelimit": len(rate_limited), "worker_error": len(svc_errors),
-                 "node_dead": len(node_failed), "breaker_skipped": breaker.skipped}
+                 "node_dead": len(node_failed), "breaker_skipped": breaker.skipped,
+                 "target_ratelimit_probed": len(probed_rl)}
     # 自检: 三类归因必须恰好等于失败总数, 出现重复计数/漏计立刻暴露
     if sum(breakdown[k] for k in ("target_ratelimit", "worker_error", "node_dead")) != len(failed):
         log("CLOUDFLARE WORKER", f"  警告: 失败归因计数不自洽 {breakdown} vs 失败总数 {len(failed)}")
+    if port_detail:
+        for p, d in port_detail.items():
+            log("CLOUDFLARE WORKER", f"  端口 {p}: 候选 {d['candidates']} 个, 真撞 429 {d['probed_429']} 个, 熔断跳过 {d['skipped']} 个")
 
     log("CLOUDFLARE WORKER", f"检测成功: {len(success)}")
     log("CLOUDFLARE WORKER", f"检测失败: {len(failed)} (节点侧不通 {len(node_failed)}, 检测服务异常 {len(svc_errors)}, 目标侧限流未测 {len(rate_limited)})")
@@ -1521,7 +1543,7 @@ def main():
         else:
             reason = f"本轮所有节点都检测不通 ({len(node_failed)} 个, 典型原因: {top_error(node_failed)})"
         return finish_degraded(session, reason, started, last_good=last_good, source=source,
-                               rate_limited_ports=tripped, **stats)
+                               rate_limited_ports=tripped, rate_limited_ports_detail=port_detail or None, **stats)
 
     if len(success) < MIN_SUCCESS:
         if last_good is None:
@@ -1530,7 +1552,7 @@ def main():
             reason = (f"本轮只有 {len(success)} 个可用节点 (< MIN_SUCCESS={MIN_SUCCESS}), 上一版有 {last_good['count']} 个, "
                       f"为避免订阅变差保留上一版 (本轮检测服务异常 {len(svc_errors)} 次, 目标侧限流 {len(rate_limited)} 次)")
             return finish_degraded(session, reason, started, last_good=last_good, source=source,
-                                   rate_limited_ports=tripped, **stats)
+                                   rate_limited_ports=tripped, rate_limited_ports_detail=port_detail or None, **stats)
 
     data = build_outputs(results, raw_count, sstp_count, source)
     # 自动优选: 在生成节点行之前现取当轮优选 IP。超时/接口挂了会自动退回静态池
@@ -1546,7 +1568,7 @@ def main():
     if format_problems:
         reason = "生成的节点行未通过格式自检, 不发布 (可能是入口池配置异常): " + "; ".join(format_problems[:3])
         return finish_degraded(session, reason, started, last_good=last_good, source=source,
-                               rate_limited_ports=tripped, **stats)
+                               rate_limited_ports=tripped, rate_limited_ports_detail=port_detail or None, **stats)
 
     new_ok = 0
     if known_keys:
@@ -1569,7 +1591,7 @@ def main():
         worker_errors=len(worker_errors),
         rate_limited=len(rate_limited),
         failure_breakdown=breakdown,
-        rate_limited_ports=tripped,
+        rate_limited_ports=tripped, rate_limited_ports_detail=port_detail or None,
         new_nodes=new_ok,
         check_budget=CHECK_BUDGET or None,
         candidates=len(uniq),

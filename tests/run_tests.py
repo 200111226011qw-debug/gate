@@ -86,6 +86,8 @@ SCENARIOS = [
     ("rl_breakdown", "目标侧限流必须单列归因, 不能混进「节点不通」", {"FAKE_WORKER": "all429", "FAKE_NODES": "10"}),
     ("worker_http403", "Worker 路由配错返回 403 —— 归服务异常, 不能算节点不通",
      {"FAKE_WORKER": "http403", "FAKE_NODES": "10"}),
+    ("budget_new_first", "额度受限时, 检测名额必须优先给新节点 (PREFER_NEW_NODES)",
+     {"FAKE_NODES": "12", "FAKE_MIX_LASTGOOD": "4", "CHECK_BUDGET": "5"}),
     ("worker_config_empty", "CHECK_WORKER 未配置 (secrets.DOMAIN 缺失/被清空)", {"CHECK_WORKER": ""}),
     ("low_success", "只有 2 个节点可用 (< MIN_SUCCESS)", {"FAKE_WORKER": "mixed_low"}),
     ("no_lastgood", "数据源全挂 + 没有上一版产物", {"FAKE_PRIMARY": "timeout", "FAKE_MIRROR": "timeout", "FAKE_LASTGOOD": "missing"}),
@@ -114,6 +116,8 @@ EXPECT = {
                          "bug": "429 被当成节点不通, 归因与「节点真不通」混为一谈"},
         "worker_http403": {"exit": 0, "nodes": 8, "min_worker_requests": 30,
                            "bug": "403 被当成节点不通 -> node_dead 虚高, 掩盖真实的配置问题"},
+        "budget_new_first": {"exit": 0, "nodes": ("gt", 0), "min_worker_requests": 10,
+                             "bug": "不识别新节点, 额度按源顺序消耗, 老节点挤占检测名额"},
     },
     "fixed": {
         # 加固版: 能用上一版就用上一版 (退出码 0), 只有彻底无内容可发布才退出 1
@@ -147,6 +151,11 @@ EXPECT = {
         # 若误归 node_dead, status_breakdown.node_dead 会 > 0; 若重试, 请求数会是 30。
         "worker_http403": {"exit": 0, "nodes": 8, "status": "stale", "max_worker_requests": 10,
                            "status_breakdown": {"node_dead": 0}},
+        # 12 个节点里前 4 个复用上一版主机名 (已知), 后 6 个是新的; CHECK_BUDGET=5
+        # -> 5 个名额必须全给新节点, 一个都不许落到 vpn90000000X 上。
+        # 这是 PREFER_NEW_NODES 唯一会被真正执行的场景 (生产 CHECK_BUDGET=0 时它不起作用)。
+        "budget_new_first": {"exit": 0, "nodes": 8, "status": "stale", "max_worker_requests": 5,
+                             "checked_prefix_absent": "vpn90000000"},
     },
 }
 
@@ -204,10 +213,16 @@ def run_case(target, scenario, extra_env):
     if status_path.exists():
         status = json.loads(status_path.read_text(encoding="utf-8"))
 
+    checked_hosts = []
     worker_requests = 0
     log_path = run_dir / "fake.log"
     if log_path.exists():
-        worker_requests = sum(1 for ln in log_path.read_text(encoding="utf-8").splitlines() if ln.startswith("worker:"))
+        for ln in log_path.read_text(encoding="utf-8").splitlines():
+            if not ln.startswith("worker:"):
+                continue
+            worker_requests += 1
+            target = ln.split(":", 2)[-1]          # 形如 host:port
+            checked_hosts.append(target.rsplit(":", 1)[0])
 
     (run_dir / "stdout.txt").write_text(proc.stdout, encoding="utf-8")
     (run_dir / "stderr.txt").write_text(proc.stderr, encoding="utf-8")
@@ -225,6 +240,7 @@ def run_case(target, scenario, extra_env):
         "status_breakdown": (status or {}).get("failure_breakdown"),
         "status_rate_limited_ports": (status or {}).get("rate_limited_ports"),
         "worker_requests": worker_requests,
+        "checked_hosts": sorted(set(checked_hosts)),
         "has_warning_annotation": "::warning::" in proc.stdout,
         "stdout_tail": proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else "",
     }
@@ -268,6 +284,12 @@ def check(expect, result):
             problems.append(f"status.rate_limited_ports={got} != 期望 {expect['status_rate_limited_ports']}")
     if expect.get("min_status_worker_errors") and (result["status_worker_errors"] or 0) < expect["min_status_worker_errors"]:
         problems.append(f"status.worker_errors={result['status_worker_errors']} < 期望 >= {expect['min_status_worker_errors']} (429 未被识别为检测服务异常)")
+    if expect.get("checked_prefix_absent"):
+        hit = [h for h in result["checked_hosts"] if h.startswith(expect["checked_prefix_absent"])]
+        if hit:
+            problems.append(f"额度被老节点占用: 检测到 {hit[:3]} (新节点优先未生效)")
+        if not result["checked_hosts"]:
+            problems.append("没有任何节点被检测, 无法验证新节点优先")
     if expect.get("source_contains") and expect["source_contains"] not in (result["status_source"] or ""):
         problems.append(f"status.source={result['status_source']!r} 不含 {expect['source_contains']!r} (没有用上官方源)")
     if expect.get("max_seconds") and result["seconds"] > expect["max_seconds"]:
