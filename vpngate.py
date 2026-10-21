@@ -526,24 +526,38 @@ def check_one(node, session, limiter=None, breaker=None):
     last_error = "check failed"
     worker_side = False
     kind = "node_dead"
+    retriable = True                  # 「归为 worker_error」与「要不要重试」已解耦, 见下方 4xx 分支
     for attempt in range(1, attempts + 1):
         if limiter is not None:
             limiter.wait()
+        retriable = True
         try:
             r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
             kind = "worker_error"
+            retriable = True
         else:
             if r.status_code != 200:
                 last_error = f"HTTP {r.status_code}"
-                kind = "worker_error" if r.status_code in (408, 425, 429, 500, 502, 503, 504) else "node_dead"
+                if r.status_code in (408, 425, 429) or 500 <= r.status_code < 600:
+                    # 408/425/429/5xx: 服务端瞬时故障或限流, 重试有意义
+                    kind, retriable = "worker_error", True
+                elif 400 <= r.status_code < 500:
+                    # 4xx 非 408/425/429 (典型 403/404): Worker 路由配错 / 鉴权缺失 /
+                    # Cloudflare 前置拦截 —— 是「请求或配置」问题, 不是节点不通。
+                    # 归 worker_error (非节点侧), 但重试同一个请求只会得到同样的 4xx, 故不重试。
+                    kind, retriable = "worker_error", False
+                else:
+                    # 3xx (session 未跟随重定向) 或非标准状态码: 保守归服务异常
+                    kind, retriable = "worker_error", True
             else:
                 try:
                     j = r.json()
                 except Exception as exc:
                     last_error = f"响应不是合法 JSON: {type(exc).__name__}"
                     kind = "worker_error"
+                    retriable = True
                 else:
                     if j.get("success"):
                         out["success"] = True
@@ -566,6 +580,8 @@ def check_one(node, session, limiter=None, breaker=None):
                     # Worker 正常返回但该节点不通: 三类归因 (目标限流 / 服务异常 / 节点不通)
                     last_error = str(j.get("error") or j.get("message") or "check failed")
                     kind = classify_failure(last_error)
+                    # target_ratelimit 走自己的 TARGET_RL_RETRIES 逻辑; node_dead 不重试
+                    retriable = (kind == "worker_error")
                     out["colo"] = j.get("colo")
                     out["latency_ms"] = j.get("responseTime")
         worker_side = kind != "node_dead"          # 非节点侧故障都计入 status.worker_errors
@@ -588,7 +604,7 @@ def check_one(node, session, limiter=None, breaker=None):
 
         if limiter is not None and hasattr(limiter, "note"):
             limiter.note("other")
-        if kind == "worker_error" and attempt < attempts:
+        if kind == "worker_error" and retriable and attempt < attempts:
             delay = CHECK_BACKOFF * attempt + random.uniform(0, 1)
             log("CLOUDFLARE WORKER", f"  检测服务异常 ({last_error}) -> {delay:.1f}s 后重试 {attempt}/{CHECK_RETRIES}: {node['host']}:{node['port']}")
             time.sleep(delay)

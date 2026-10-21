@@ -84,6 +84,8 @@ SCENARIOS = [
     ("port_cb", "整个端口被目标侧限流 (:443 全灭) —— 端口熔断后额度让给其它端口",
      {"FAKE_WORKER": "all429", "FAKE_SAME_PORT": "443", "FAKE_NODES": "20", "PORT_CB_THRESHOLD": "4"}),
     ("rl_breakdown", "目标侧限流必须单列归因, 不能混进「节点不通」", {"FAKE_WORKER": "all429", "FAKE_NODES": "10"}),
+    ("worker_http403", "Worker 路由配错返回 403 —— 归服务异常, 不能算节点不通",
+     {"FAKE_WORKER": "http403", "FAKE_NODES": "10"}),
     ("worker_config_empty", "CHECK_WORKER 未配置 (secrets.DOMAIN 缺失/被清空)", {"CHECK_WORKER": ""}),
     ("low_success", "只有 2 个节点可用 (< MIN_SUCCESS)", {"FAKE_WORKER": "mixed_low"}),
     ("no_lastgood", "数据源全挂 + 没有上一版产物", {"FAKE_PRIMARY": "timeout", "FAKE_MIRROR": "timeout", "FAKE_LASTGOOD": "missing"}),
@@ -110,6 +112,8 @@ EXPECT = {
                     "bug": "不会按端口熔断 -> 20 个节点全打一遍, 全部撞 429"},
         "rl_breakdown": {"exit": 0, "nodes": 8, "min_worker_requests": 10,
                          "bug": "429 被当成节点不通, 归因与「节点真不通」混为一谈"},
+        "worker_http403": {"exit": 0, "nodes": 8, "min_worker_requests": 30,
+                           "bug": "403 被当成节点不通 -> node_dead 虚高, 掩盖真实的配置问题"},
     },
     "fixed": {
         # 加固版: 能用上一版就用上一版 (退出码 0), 只有彻底无内容可发布才退出 1
@@ -139,6 +143,10 @@ EXPECT = {
         # 归因: 9 个 SSTP 节点全撞 429, 必须全部归到 target_ratelimit, 一个都不许算 node_dead
         "rl_breakdown": {"exit": 0, "nodes": 8, "status": "stale",
                          "status_breakdown": {"target_ratelimit": 9, "node_dead": 0}},
+        # 10 个 SSTP 节点全部撞 403: 归 worker_error (非节点侧), 且不重试 -> 请求数 == 10。
+        # 若误归 node_dead, status_breakdown.node_dead 会 > 0; 若重试, 请求数会是 30。
+        "worker_http403": {"exit": 0, "nodes": 8, "status": "stale", "max_worker_requests": 10,
+                           "status_breakdown": {"node_dead": 0}},
     },
 }
 

@@ -145,6 +145,9 @@ def _worker(target, mode):
         raise FakeError("ConnectTimeout: fake worker timeout")
     if mode == "http503":
         return _Response(503, "Service Unavailable")
+    if mode == "http403":
+        # Worker 路由配错 / 鉴权缺失 / Cloudflare 前置拦截 —— 是配置问题, 不是节点不通
+        return _Response(403, "Forbidden")
     if mode == "all429":
         return _Response(200, payload={
             "success": False, "colo": "AMS", "responseTime": 5200,
