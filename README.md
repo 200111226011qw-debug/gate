@@ -204,6 +204,31 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 | `stale` | 本轮数据源/检测服务异常 → **沿用上一版产物**，订阅不中断 | 0（绿色 + `::warning::` 注解） |
 | `failed` | 既拿不到新数据、又没有上一版产物 → 不发布空订阅 | 1（红色） |
 
+排查时要读的字段：
+
+| 字段 | 含义 |
+| :--- | :--- |
+| `failure_breakdown.target_ratelimit` | 目标侧限流**归因总数**（含熔断跳过，见下方警告） |
+| `failure_breakdown.target_ratelimit_probed` | **真实发出请求**并撞到 429 的次数（不含熔断跳过） |
+| `failure_breakdown.node_dead` / `worker_error` | 节点真不通 / 检测服务异常（非节点侧） |
+| `rate_limited_ports` | 本轮被熔断的端口列表 |
+| `rate_limited_ports_detail` | 每个熔断端口的 `candidates` / `probed_429` / `skipped` |
+| `new_nodes` | 本轮新增可用节点数（上一版没有的） |
+
+> ⚠️ **读 `failure_breakdown` 别重复计数**：被端口熔断跳过的节点 `failure_kind` 同样是
+> `target_ratelimit`（它是「未测」，不是「不通」），所以
+> **`target_ratelimit` = 真撞 429 的数量 + 熔断跳过的数量**，二者是包含关系、不能相加。
+> 想看实际撞了几次 429，读 `target_ratelimit_probed`。
+> `rate_limited_ports_detail[].skipped` 是 `target_ratelimit` 的一部分，不是额外一拨。
+>
+> **怎么判断熔断阈值（`PORT_CB_THRESHOLD`）合不合适**：看 `probed_429 : skipped` 的比值。
+> 比值接近或大于 1（跳过的比实测的还多）说明熔断来得太晚、多烧了额度；
+> 实测数远大于阈值才熔断，说明阈值偏低。配合 `candidates` 还能看出是否整段误杀。
+>
+> 注：`rate_limited_ports_detail` 是 **list-of-dict**（形如
+> `[{"port": 443, "candidates": 20, ...}]`），不是以端口为 key 的 dict ——
+> JSON 的 key 只能是字符串，写成 dict 会让消费方拿到 `"443"` 而不是 `443`。
+
 关键规则：
 
 1. **绝不发布空订阅**：只要本轮 0 个可用节点，就沿用上一版 `nodes.txt`（不会把 edgetunnel 的订阅清空）。

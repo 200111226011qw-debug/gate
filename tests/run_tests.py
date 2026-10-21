@@ -143,7 +143,7 @@ EXPECT = {
         "no_lastgood": {"exit": 1, "nodes": None},
         # 端口熔断: 20 个节点全在 :443, 连续 4 次 429 后熔断 -> 请求数必须明显少于 20
         "port_cb": {"exit": 0, "nodes": 8, "status": "stale", "max_worker_requests": 16,
-                    "status_rate_limited_ports": [443]},
+                    "status_rate_limited_ports": [443], "port_detail_invariant": True},
         # 归因: 9 个 SSTP 节点全撞 429, 必须全部归到 target_ratelimit, 一个都不许算 node_dead
         "rl_breakdown": {"exit": 0, "nodes": 8, "status": "stale",
                          "status_breakdown": {"target_ratelimit": 9, "node_dead": 0}},
@@ -239,6 +239,7 @@ def run_case(target, scenario, extra_env):
         "status_worker_errors": (status or {}).get("worker_errors"),
         "status_breakdown": (status or {}).get("failure_breakdown"),
         "status_rate_limited_ports": (status or {}).get("rate_limited_ports"),
+        "status_port_detail": (status or {}).get("rate_limited_ports_detail"),
         "worker_requests": worker_requests,
         "checked_hosts": sorted(set(checked_hosts)),
         "has_warning_annotation": "::warning::" in proc.stdout,
@@ -284,6 +285,22 @@ def check(expect, result):
             problems.append(f"status.rate_limited_ports={got} != 期望 {expect['status_rate_limited_ports']}")
     if expect.get("min_status_worker_errors") and (result["status_worker_errors"] or 0) < expect["min_status_worker_errors"]:
         problems.append(f"status.worker_errors={result['status_worker_errors']} < 期望 >= {expect['min_status_worker_errors']} (429 未被识别为检测服务异常)")
+    if expect.get("port_detail_invariant"):
+        # 不变式: 每个熔断端口的 candidates == probed_429 + skipped (端口上的候选要么被
+        # 实测、要么被跳过)。不依赖并发数, 因此断言是确定的。
+        got = result["status_port_detail"] or []
+        if not got:
+            problems.append("status.rate_limited_ports_detail 缺失, 无法判断熔断是否过度误杀")
+        for d in got:
+            if not isinstance(d, dict) or "port" not in d:
+                problems.append(f"rate_limited_ports_detail 元素结构异常: {d!r}")
+                continue
+            if not isinstance(d.get("port"), int):
+                problems.append(f"rate_limited_ports_detail.port 应为 int, 实际 {type(d.get('port')).__name__} ({d.get('port')!r}) — JSON key 字符串化陷阱")
+            if d.get("candidates") != (d.get("probed_429") or 0) + (d.get("skipped") or 0):
+                problems.append(f"端口 {d.get('port')} 计数不守恒: candidates={d.get('candidates')} != probed_429={d.get('probed_429')} + skipped={d.get('skipped')}")
+            if not d.get("candidates"):
+                problems.append(f"端口 {d.get('port')} candidates 为 0, 无法判断是否过度误杀")
     if expect.get("checked_prefix_absent"):
         hit = [h for h in result["checked_hosts"] if h.startswith(expect["checked_prefix_absent"])]
         if hit:

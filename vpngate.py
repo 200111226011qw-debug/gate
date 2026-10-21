@@ -1498,13 +1498,16 @@ def main():
     port_candidates = {}
     for n in selected:
         port_candidates[n["port"]] = port_candidates.get(n["port"], 0) + 1
-    port_detail = {}
+    # list-of-dict 而非 {port: {...}}: JSON 的 key 只能是字符串, 写成 dict 会让消费方
+    # 拿到 "443" 而非 443, 直接按 int 取值会静默失败 (不会报错, 只会什么都取不到)。
+    port_detail = []
     for p in tripped:
-        port_detail[str(p)] = {
+        port_detail.append({
+            "port": p,
             "candidates": port_candidates.get(p, 0),
             "probed_429": sum(1 for r in probed_rl if r.get("port") == p),
             "skipped": sum(1 for r in failed if r.get("skipped_by_breaker") and r.get("port") == p),
-        }
+        })
 
     breakdown = {"target_ratelimit": len(rate_limited), "worker_error": len(svc_errors),
                  "node_dead": len(node_failed), "breaker_skipped": breaker.skipped,
@@ -1513,8 +1516,8 @@ def main():
     if sum(breakdown[k] for k in ("target_ratelimit", "worker_error", "node_dead")) != len(failed):
         log("CLOUDFLARE WORKER", f"  警告: 失败归因计数不自洽 {breakdown} vs 失败总数 {len(failed)}")
     if port_detail:
-        for p, d in port_detail.items():
-            log("CLOUDFLARE WORKER", f"  端口 {p}: 候选 {d['candidates']} 个, 真撞 429 {d['probed_429']} 个, 熔断跳过 {d['skipped']} 个")
+        for d in port_detail:
+            log("CLOUDFLARE WORKER", f"  端口 {d['port']}: 候选 {d['candidates']} 个, 真撞 429 {d['probed_429']} 个, 熔断跳过 {d['skipped']} 个")
 
     log("CLOUDFLARE WORKER", f"检测成功: {len(success)}")
     log("CLOUDFLARE WORKER", f"检测失败: {len(failed)} (节点侧不通 {len(node_failed)}, 检测服务异常 {len(svc_errors)}, 目标侧限流未测 {len(rate_limited)})")
