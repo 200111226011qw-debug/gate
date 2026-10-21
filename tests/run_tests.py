@@ -142,8 +142,12 @@ EXPECT = {
         "low_success": {"exit": 0, "nodes": 8, "status": "stale"},
         "no_lastgood": {"exit": 1, "nodes": None},
         # 端口熔断: 20 个节点全在 :443, 连续 4 次 429 后熔断 -> 请求数必须明显少于 20
+        # port_cb: 20 个节点全在 :443 (FAKE_SAME_PORT), 其中 i%6==5 的 3 个是 UDP 被过滤,
+        # 故去重后源里 :443 恰好 17 个。写死 17 是为了锁住 candidates_in_source 的统计来源
+        # —— 它必须来自「去重后未经任何截断」的全集, 而不是被 MAX_CHECK_NODES 截过的池。
         "port_cb": {"exit": 0, "nodes": 8, "status": "stale", "max_worker_requests": 16,
-                    "status_rate_limited_ports": [443], "port_detail_invariant": True},
+                    "status_rate_limited_ports": [443], "port_detail_invariant": True,
+                    "port_detail_expect": [{"port": 443, "candidates_in_source": 17, "candidates": 17}]},
         # 归因: 9 个 SSTP 节点全撞 429, 必须全部归到 target_ratelimit, 一个都不许算 node_dead
         "rl_breakdown": {"exit": 0, "nodes": 8, "status": "stale",
                          "status_breakdown": {"target_ratelimit": 9, "node_dead": 0}},
@@ -306,6 +310,20 @@ def check(expect, result):
                 problems.append(f"端口 {d.get('port')} 缺 candidates_in_source (无法判断是否整段误杀)")
             elif d.get("candidates_in_source") < d.get("candidates"):
                 problems.append(f"端口 {d.get('port')} candidates_in_source={d.get('candidates_in_source')} < candidates={d.get('candidates')} (源总数不可能小于计划检测数)")
+    if expect.get("port_detail_expect"):
+        # 写死具体数值: 防止有人「优化」candidates_in_source 的统计来源
+        # (比如改回用被 MAX_CHECK_NODES 截断后的 uniq 来算) 而断言仍然绿。
+        got = result["status_port_detail"] or []
+        for want in expect["port_detail_expect"]:
+            hit = [d for d in got if d.get("port") == want["port"]]
+            if not hit:
+                problems.append(f"rate_limited_ports_detail 里没有 port={want['port']}: {got}")
+                continue
+            d = hit[0]
+            for k, v in want.items():
+                if k == "port" or d.get(k) == v:
+                    continue
+                problems.append(f"端口 {want['port']} 的 {k}={d.get(k)} != 期望 {v}")
     if expect.get("checked_prefix_absent"):
         hit = [h for h in result["checked_hosts"] if h.startswith(expect["checked_prefix_absent"])]
         if hit:

@@ -1446,7 +1446,11 @@ def main():
             raw_nodes=raw_count,
         )
 
-    uniq = dedupe(sstp_nodes)
+    # uniq_all = 去重后、未经任何截断的源规模; uniq = 可能被 MAX_CHECK_NODES 截断后的检测池。
+    # 必须分开保留: candidates_in_source 要的是「数据源里该端口有多少」, 用被截断过的
+    # uniq 统计会让这个字段名在设了 MAX_CHECK_NODES 之后撒谎 (误杀判断会偏)。
+    uniq_all = dedupe(sstp_nodes)
+    uniq = uniq_all
     if MAX_CHECK_NODES > 0:
         uniq = uniq[:MAX_CHECK_NODES]
 
@@ -1501,7 +1505,7 @@ def main():
     port_candidates_source = {}   # 数据源原始 (截断前)
     for n in selected:
         port_candidates[n["port"]] = port_candidates.get(n["port"], 0) + 1
-    for n in uniq:
+    for n in uniq_all:
         port_candidates_source[n["port"]] = port_candidates_source.get(n["port"], 0) + 1
     # list-of-dict 而非 {port: {...}}: JSON 的 key 只能是字符串, 写成 dict 会让消费方
     # 拿到 "443" 而非 443, 直接按 int 取值会静默失败 (不会报错, 只会什么都取不到)。
