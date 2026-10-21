@@ -12,7 +12,9 @@ tests/runs*/
 tests/results.json
 tests/_synthesized_*.py
 # 工作笔记 / 临时诊断脚本等本地产物, 不入库
-# 注意: git add -A 会把工作区根目录下的这类文件一起提交, 提交前用 git status 核对
-2026-10-*.md
-diag_*.py
-_diag*/
+# 锚定仓库根目录 (/ 开头): 不加锚定时 "2026-10-*.md" 会连 2026-10-changelog.md 之类的
+# 正式文档一起静默忽略, 且 git status 看不到, 排查很麻烦。
+# 另外: 提交前用 git status 核对, 不要用 git add -A (会把根目录这类文件一起带上)。
+/2026-10-21.md
+/diag_check.py
+/_diag*/
