@@ -209,17 +209,20 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 | 字段 | 含义 |
 | :--- | :--- |
 | `failure_breakdown.target_ratelimit` | 目标侧限流**归因总数**（含熔断跳过，见下方警告） |
-| `failure_breakdown.target_ratelimit_probed` | **真实发出请求**并撞到 429 的次数（不含熔断跳过） |
+| `failure_breakdown.target_ratelimit_probed` | 真实撞到 429 的**节点数**（不含熔断跳过）。默认 `TARGET_RL_RETRIES=0` 时等于请求次数；把该值调大后一个节点可能发多次请求，此字段仍按节点计 |
 | `failure_breakdown.node_dead` / `worker_error` | 节点真不通 / 检测服务异常（非节点侧） |
 | `rate_limited_ports` | 本轮被熔断的端口列表 |
-| `rate_limited_ports_detail` | 每个熔断端口的 `candidates` / `probed_429` / `skipped` |
+| `rate_limited_ports_detail` | 每个熔断端口的 `candidates` / `candidates_in_source` / `probed_429` / `skipped` |
+| `rate_limited_ports_detail[].candidates` | 该端口**本轮计划检测**的候选数 —— 受 `CHECK_BUDGET` / `MAX_CHECK_NODES` 截断影响，**不是数据源原始总数** |
+| `rate_limited_ports_detail[].candidates_in_source` | 该端口在**数据源里**的候选总数（截断前）。判断「是否整段误杀」要看这个 |
 | `new_nodes` | 本轮新增可用节点数（上一版没有的） |
 
 > ⚠️ **读 `failure_breakdown` 别重复计数**：被端口熔断跳过的节点 `failure_kind` 同样是
 > `target_ratelimit`（它是「未测」，不是「不通」），所以
 > **`target_ratelimit` = 真撞 429 的数量 + 熔断跳过的数量**，二者是包含关系、不能相加。
-> 想看实际撞了几次 429，读 `target_ratelimit_probed`。
-> `rate_limited_ports_detail[].skipped` 是 `target_ratelimit` 的一部分，不是额外一拨。
+> 想看有几个节点真的撞到了 429，读 `target_ratelimit_probed`。
+> `rate_limited_ports_detail` 里对应端口（如 `port=443`）那一项的 `skipped`，是 `target_ratelimit` 的一部分，不是额外一拨。
+> 读 `candidates` 时注意它已被 `CHECK_BUDGET` 截断，要看数据源里的真实规模读 `candidates_in_source`。
 >
 > **怎么判断熔断阈值（`PORT_CB_THRESHOLD`）合不合适**：看 `probed_429 : skipped` 的比值。
 > 比值接近或大于 1（跳过的比实测的还多）说明熔断来得太晚、多烧了额度；
@@ -270,14 +273,15 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 > **怎么看本轮到底发生了什么**：直接看 `status.json` 的 `failure_breakdown`
 > （`target_ratelimit` / `worker_error` / `node_dead` 三类分别多少个）、
 > `rate_limited_ports`（被熔断的端口）、`rate_limited_ports_detail`（每个被熔断端口的
-> 候选总数 / 真撞 429 数 / 跳过数）、`new_nodes`（本轮新增可用节点数）。
+> 候选数 / 真撞 429 节点数 / 跳过数）、`new_nodes`（本轮新增可用节点数）。
 > 三类之和恒等于失败总数 —— 不对就是脚本的归因出 bug 了，日志里会有「失败归因计数不自洽」告警。
 >
 > ⚠️ **读 `failure_breakdown` 时别重复计数**：被端口熔断跳过的节点 `failure_kind` 也是
 > `target_ratelimit`（它是「未测」不是「不通」），所以
-> **`target_ratelimit` = 真撞 429 的数量 + 熔断跳过的数量**，两者是包含关系、不能相加。
-> 想看「实际发出了多少次请求并撞到 429」，读 `target_ratelimit_probed`。
-> 同理 `rate_limited_ports_detail.443.skipped` 是 `target_ratelimit` 的一部分，不是额外的一拨。
+> **`target_ratelimit` = 真撞 429 的节点数 + 熔断跳过的节点数**，两者是包含关系、不能相加。
+> 想看有几个节点真撞到了 429，读 `target_ratelimit_probed`。
+> 同理 `rate_limited_ports_detail` 里对应端口（如 `port=443`）那一项的 `skipped`，
+> 也是 `target_ratelimit` 的一部分，不是额外一拨。
 
 ### 关于「429 限流」与「节点不通」的区别（重要）
 两者都会被检测 Worker 判成 `success=false`，但含义完全不同：
@@ -311,8 +315,8 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 
 | 日期 | 版本 | 变更 |
 | :--- | :--- | :--- |
-| 2026-10-21 | v1.6.1 | **修复 `PREFER_NEW_NODES` 排序键写反**（写成「老节点优先」，与语义相反；`CHECK_BUDGET=0` 时不触发故一直未暴露）；`status.json` 增加 `target_ratelimit_probed`（真撞 429 次数）与 `rate_limited_ports_detail`（被熔断端口的候选/撞限流/跳过数），以区分「限流 14」中的包含关系、便于判断是否过度误杀；测试新增 `worker_http403`、`budget_new_first` 两场景 |
-| 2026-10-21 | v1.6.0 | **修复「抓不到新节点」**：失败三级归因（`target_ratelimit`/`worker_error`/`node_dead`），429 默认不重试；新增按端口自适应熔断（`PORT_CB_THRESHOLD`）+ 全局滑窗退避（`GLOBAL_RL_*`）；新增检测预算 `CHECK_BUDGET` 与「新节点/住宅型优先」（`PREFER_NEW_NODES`）；`status.json` 增加 `failure_breakdown`/`rate_limited_ports`/`new_nodes`；修复降级分支不写 `status.json` 的 bug（`failed` 时产物缺失导致误判「脚本没跑」）；测试新增 `port_cb`、`rl_breakdown` 两场景 |
+| 2026-10-21 | v1.6.1 | **修复 `PREFER_NEW_NODES` 排序键写反**（写成「老节点优先」，与语义相反；`CHECK_BUDGET=0` 时不触发截断分支故一直未暴露）；`status.json` 增加 `target_ratelimit_probed` 与 `rate_limited_ports_detail`，以区分「限流 14」中的包含关系；`rate_limited_ports_detail` 采用 list-of-dict（`port` 为 int，避免 JSON key 字符串化）；测试新增 `budget_new_first` 场景 |
+| 2026-10-21 | v1.6.0 | **修复「抓不到新节点」**：失败三级归因（`target_ratelimit`/`worker_error`/`node_dead`），429 默认不重试；新增按端口自适应熔断（`PORT_CB_THRESHOLD`）+ 全局滑窗退避（`GLOBAL_RL_*`）；新增检测预算 `CHECK_BUDGET` 与「新节点/住宅型优先」（`PREFER_NEW_NODES`）；`status.json` 增加 `failure_breakdown`/`rate_limited_ports`/`new_nodes`；修复降级分支不写 `status.json` 的 bug（`failed` 时产物缺失导致误判「脚本没跑」）；测试新增 `port_cb`、`rl_breakdown`、`worker_http403` 三场景 |
 | 2026-10-12 | v1.5.1 | **配置修正**：本地实测 125 个静态优选域名（TCP 443 + `/cdn-cgi/trace` 双检），剔除 DNS 失效的 `cmcc.cc.cd:443`，入口池 125 → 124 个 |
 | 2026-10-12 | v1.5.0 | **行为变更（minor）**：新增 `OPTIMAL_API` 内置自动优选 —— 每轮运行从优选接口现取优选 IP 置于入口池首，支持 `off`/`0`/`none`/`false` 关闭；`filter_edge_hosts` 新增裸 IP 分支（只做 TCP 检测，不参与 DNS 污染判定）；`data.json` 新增 `optimal_api` 字段；`tests/run_tests.py` 回归环境设 `OPTIMAL_API=off` 保证离线可复现 |
 

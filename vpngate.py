@@ -1495,9 +1495,14 @@ def main():
     # 所以 target_ratelimit = 真撞 429 的数量 + 熔断跳过的数量。两个数字不并列、不能相加。
     probed_rl = [r for r in rate_limited if not r.get("skipped_by_breaker")]
     # 每个被熔断端口的候选总数: 没有它就无法判断「跳过 7 个」是正常熔断还是整段砍掉
-    port_candidates = {}
+    # 两个口径都要留: 一旦设了 CHECK_BUDGET / MAX_CHECK_NODES, 「数据源里该端口有多少候选」
+    # 与「本轮计划检测多少」就是两个不同的数 —— 判断「是否整段误杀」要看前者。
+    port_candidates = {}          # 本轮计划检测 (截断后)
+    port_candidates_source = {}   # 数据源原始 (截断前)
     for n in selected:
         port_candidates[n["port"]] = port_candidates.get(n["port"], 0) + 1
+    for n in uniq:
+        port_candidates_source[n["port"]] = port_candidates_source.get(n["port"], 0) + 1
     # list-of-dict 而非 {port: {...}}: JSON 的 key 只能是字符串, 写成 dict 会让消费方
     # 拿到 "443" 而非 443, 直接按 int 取值会静默失败 (不会报错, 只会什么都取不到)。
     port_detail = []
@@ -1505,6 +1510,7 @@ def main():
         port_detail.append({
             "port": p,
             "candidates": port_candidates.get(p, 0),
+            "candidates_in_source": port_candidates_source.get(p, 0),
             "probed_429": sum(1 for r in probed_rl if r.get("port") == p),
             "skipped": sum(1 for r in failed if r.get("skipped_by_breaker") and r.get("port") == p),
         })
@@ -1517,7 +1523,7 @@ def main():
         log("CLOUDFLARE WORKER", f"  警告: 失败归因计数不自洽 {breakdown} vs 失败总数 {len(failed)}")
     if port_detail:
         for d in port_detail:
-            log("CLOUDFLARE WORKER", f"  端口 {d['port']}: 候选 {d['candidates']} 个, 真撞 429 {d['probed_429']} 个, 熔断跳过 {d['skipped']} 个")
+            log("CLOUDFLARE WORKER", f"  端口 {d['port']}: 候选 {d['candidates']} 个 (源 {d['candidates_in_source']} 个), 真撞 429 {d['probed_429']} 个节点, 熔断跳过 {d['skipped']} 个")
 
     log("CLOUDFLARE WORKER", f"检测成功: {len(success)}")
     log("CLOUDFLARE WORKER", f"检测失败: {len(failed)} (节点侧不通 {len(node_failed)}, 检测服务异常 {len(svc_errors)}, 目标侧限流未测 {len(rate_limited)})")

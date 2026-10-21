@@ -301,6 +301,11 @@ def check(expect, result):
                 problems.append(f"端口 {d.get('port')} 计数不守恒: candidates={d.get('candidates')} != probed_429={d.get('probed_429')} + skipped={d.get('skipped')}")
             if not d.get("candidates"):
                 problems.append(f"端口 {d.get('port')} candidates 为 0, 无法判断是否过度误杀")
+            # 截断关闭时 (CHECK_BUDGET=0) 两个口径应相等; 截断开启后 source >= planned
+            if d.get("candidates_in_source") is None:
+                problems.append(f"端口 {d.get('port')} 缺 candidates_in_source (无法判断是否整段误杀)")
+            elif d.get("candidates_in_source") < d.get("candidates"):
+                problems.append(f"端口 {d.get('port')} candidates_in_source={d.get('candidates_in_source')} < candidates={d.get('candidates')} (源总数不可能小于计划检测数)")
     if expect.get("checked_prefix_absent"):
         hit = [h for h in result["checked_hosts"] if h.startswith(expect["checked_prefix_absent"])]
         if hit:
