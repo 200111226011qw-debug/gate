@@ -11,3 +11,8 @@ tests/runs_*/
 tests/runs*/
 tests/results.json
 tests/_synthesized_*.py
+# 工作笔记 / 临时诊断脚本等本地产物, 不入库
+# 注意: git add -A 会把工作区根目录下的这类文件一起提交, 提交前用 git status 核对
+2026-10-*.md
+diag_*.py
+_diag*/
