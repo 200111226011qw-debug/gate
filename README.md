@@ -226,7 +226,12 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 >
 > **怎么判断熔断阈值（`PORT_CB_THRESHOLD`）合不合适**：看 `probed_429 : skipped` 的比值。
 > 比值接近或大于 1（跳过的比实测的还多）说明熔断来得太晚、多烧了额度；
-> 实测数远大于阈值才熔断，说明阈值偏低。配合 `candidates` 还能看出是否整段误杀。
+> 实测数远大于阈值才熔断，说明阈值偏低。配合 `candidates_in_source` 还能看出是否整段误杀。
+>
+> **怎么判断 `PREFER_NEW_NODES` 是否真的生效**：先看日志 `VPN GATE` 那行的「去重后 N」。
+> 只有 **N > `CHECK_BUDGET`** 时截断才真正发生 —— 若 N ≤ budget，排序函数虽然被调用，
+> 但 `ordered[:budget]` 不截断，「谁排前面」对产物没有任何可观测影响，
+> 该轮只是又一次回归检查，**不能据此说排序功能已验证**。
 >
 > 注：`rate_limited_ports_detail` 是 **list-of-dict**（形如
 > `[{"port": 443, "candidates": 20, ...}]`），不是以端口为 key 的 dict ——
@@ -242,7 +247,7 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 6. **发布前产物自检**：`validate_nodes_text()` 逐行校验 `nodes.txt`（入口与节点主机必须是域名），格式不合格就**拒绝发布**并降级沿用上一版 —— 防止「运行绿色但订阅是坏的」（2026-10-07 踩过这个坑：入口池被按字符拆开，每行入口变成单个字母，而当时测试只数行数）。
 7. **入口池解析**：`_env_csv()` 统一读取「逗号分隔」配置，**返回条目列表**，调用方不需要（也无法忘记）`.split(",")`。
 
-> 想本地验证这些行为（无需联网）：`python tests/run_tests.py`（15 组故障场景）。
+> 想本地验证这些行为（无需联网）：`python tests/run_tests.py`（16 组故障场景）。
 > 沙箱环境若因批量删除被拦，换一个空的运行目录即可：`TEST_RUNS_DIR=tests/runs_v2 python tests/run_tests.py`。
 
 ---

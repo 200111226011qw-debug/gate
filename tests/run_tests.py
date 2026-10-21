@@ -88,6 +88,9 @@ SCENARIOS = [
      {"FAKE_WORKER": "http403", "FAKE_NODES": "10"}),
     ("budget_new_first", "额度受限时, 检测名额必须优先给新节点 (PREFER_NEW_NODES)",
      {"FAKE_NODES": "12", "FAKE_MIX_LASTGOOD": "4", "CHECK_BUDGET": "5"}),
+    ("budget_truncate", "MAX_CHECK_NODES 截断后, candidates_in_source 必须仍是源规模 (不跟随截断)",
+     {"FAKE_WORKER": "all429", "FAKE_SAME_PORT": "443", "FAKE_NODES": "20",
+      "MAX_CHECK_NODES": "10", "PORT_CB_THRESHOLD": "4"}),
     ("worker_config_empty", "CHECK_WORKER 未配置 (secrets.DOMAIN 缺失/被清空)", {"CHECK_WORKER": ""}),
     ("low_success", "只有 2 个节点可用 (< MIN_SUCCESS)", {"FAKE_WORKER": "mixed_low"}),
     ("no_lastgood", "数据源全挂 + 没有上一版产物", {"FAKE_PRIMARY": "timeout", "FAKE_MIRROR": "timeout", "FAKE_LASTGOOD": "missing"}),
@@ -118,6 +121,8 @@ EXPECT = {
                            "bug": "403 被当成节点不通 -> node_dead 虚高, 掩盖真实的配置问题"},
         "budget_new_first": {"exit": 0, "nodes": ("gt", 0), "min_worker_requests": 10,
                              "bug": "不识别新节点, 额度按源顺序消耗, 老节点挤占检测名额"},
+        "budget_truncate": {"exit": 0, "nodes": ("gt", 0),
+                            "bug": "无 candidates_in_source 字段, 无法区分「源规模」与「截断后规模」"},
     },
     "fixed": {
         # 加固版: 能用上一版就用上一版 (退出码 0), 只有彻底无内容可发布才退出 1
@@ -145,6 +150,12 @@ EXPECT = {
         # port_cb: 20 个节点全在 :443 (FAKE_SAME_PORT), 其中 i%6==5 的 3 个是 UDP 被过滤,
         # 故去重后源里 :443 恰好 17 个。写死 17 是为了锁住 candidates_in_source 的统计来源
         # —— 它必须来自「去重后未经任何截断」的全集, 而不是被 MAX_CHECK_NODES 截过的池。
+        # 注意本场景 MAX_CHECK_NODES=0 (BASE_ENV 未设置 -> 默认 0), 因此 uniq == uniq_all,
+        # candidates == candidates_in_source == 17, 两个值相等。这条断言只在「有人把
+        # candidates_in_source 的统计源改回 uniq」时才会变红 —— 而要真正触发这个分叉,
+        # 变异验证必须额外设 MAX_CHECK_NODES < 17 (例如 10), 否则改回 uniq 也测不出来。
+        # 换句话说: 日常回归里这条断言绿, 不代表「分叉路径被覆盖」, 它防的是代码被改回去。
+        # 分叉路径本身的自动覆盖见 budget_truncate 场景。
         "port_cb": {"exit": 0, "nodes": 8, "status": "stale", "max_worker_requests": 16,
                     "status_rate_limited_ports": [443], "port_detail_invariant": True,
                     "port_detail_expect": [{"port": 443, "candidates_in_source": 17, "candidates": 17}]},
@@ -160,6 +171,12 @@ EXPECT = {
         # 这是 PREFER_NEW_NODES 唯一会被真正执行的场景 (生产 CHECK_BUDGET=0 时它不起作用)。
         "budget_new_first": {"exit": 0, "nodes": 8, "status": "stale", "max_worker_requests": 5,
                              "checked_prefix_absent": "vpn90000000"},
+        # 分叉路径的自动守卫: MAX_CHECK_NODES=10 时 uniq (10) != uniq_all (17)。
+        # 断言 candidates_in_source 必须仍是 17 (源规模), candidates 是 10 (截断后)。
+        # 这样「把统计源改回 uniq」的回归就由日常回归兜住, 不再依赖人工变异验证。
+        "budget_truncate": {"exit": 0, "nodes": 8, "status": "stale", "max_worker_requests": 10,
+                            "port_detail_invariant": True,
+                            "port_detail_expect": [{"port": 443, "candidates_in_source": 17, "candidates": 10}]},
     },
 }
 
@@ -313,6 +330,12 @@ def check(expect, result):
     if expect.get("port_detail_expect"):
         # 写死具体数值: 防止有人「优化」candidates_in_source 的统计来源
         # (比如改回用被 MAX_CHECK_NODES 截断后的 uniq 来算) 而断言仍然绿。
+        #
+        # 变异验证前提: 下面比较的是「绝对值」, 而 port_cb 场景 MAX_CHECK_NODES=0,
+        # 两种统计口径结果相同 (都是 17)。要把这条断言当作「分叉哨兵」验证一次,
+        # 需临时加 MAX_CHECK_NODES=10 并故意把 vpngate.py 里的统计源改回 uniq ——
+        # 此时应报 candidates_in_source=10 != 期望 17。做完记得还原,
+        # 不要把这个设置留在 BASE_ENV (会让其它场景的候选数一起变)。
         got = result["status_port_detail"] or []
         for want in expect["port_detail_expect"]:
             hit = [d for d in got if d.get("port") == want["port"]]
