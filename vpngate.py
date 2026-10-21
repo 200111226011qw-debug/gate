@@ -1509,8 +1509,13 @@ def main():
         port_candidates_source[n["port"]] = port_candidates_source.get(n["port"], 0) + 1
     # list-of-dict 而非 {port: {...}}: JSON 的 key 只能是字符串, 写成 dict 会让消费方
     # 拿到 "443" 而非 443, 直接按 int 取值会静默失败 (不会报错, 只会什么都取不到)。
+    # 记录「所有出现 429 的端口」∪「所有被熔断的端口」, 而不是只记录 tripped。
+    # 原因: 若某端口限流缓解到没触发熔断 (例如只撞了 3 次 < 阈值 4), 它仍然发生了 429,
+    # 我们依旧需要它的 candidates_in_source 来判断「阈值是不是设得太晚」。只记 tripped 会
+    # 形成反向激励 —— 越是「阈值可能错了」的情况 (没熔断), 越拿不到数据。
+    detail_ports = set(tripped) | {r["port"] for r in probed_rl if r.get("port") is not None}
     port_detail = []
-    for p in tripped:
+    for p in sorted(detail_ports):
         port_detail.append({
             "port": p,
             "candidates": port_candidates.get(p, 0),
@@ -1527,7 +1532,8 @@ def main():
         log("CLOUDFLARE WORKER", f"  警告: 失败归因计数不自洽 {breakdown} vs 失败总数 {len(failed)}")
     if port_detail:
         for d in port_detail:
-            log("CLOUDFLARE WORKER", f"  端口 {d['port']}: 候选 {d['candidates']} 个 (源 {d['candidates_in_source']} 个), 真撞 429 {d['probed_429']} 个节点, 熔断跳过 {d['skipped']} 个")
+            state = "已熔断" if d["skipped"] else "未熔断"
+            log("CLOUDFLARE WORKER", f"  端口 {d['port']} [{state}]: 候选 {d['candidates']} 个 (源 {d['candidates_in_source']} 个), 真撞 429 {d['probed_429']} 个节点, 熔断跳过 {d['skipped']} 个")
 
     log("CLOUDFLARE WORKER", f"检测成功: {len(success)}")
     log("CLOUDFLARE WORKER", f"检测失败: {len(failed)} (节点侧不通 {len(node_failed)}, 检测服务异常 {len(svc_errors)}, 目标侧限流未测 {len(rate_limited)})")
@@ -1556,7 +1562,7 @@ def main():
         else:
             reason = f"本轮所有节点都检测不通 ({len(node_failed)} 个, 典型原因: {top_error(node_failed)})"
         return finish_degraded(session, reason, started, last_good=last_good, source=source,
-                               rate_limited_ports=tripped, rate_limited_ports_detail=port_detail or None, **stats)
+                               rate_limited_ports=tripped, port_429_detail=port_detail or None, **stats)
 
     if len(success) < MIN_SUCCESS:
         if last_good is None:
@@ -1565,7 +1571,7 @@ def main():
             reason = (f"本轮只有 {len(success)} 个可用节点 (< MIN_SUCCESS={MIN_SUCCESS}), 上一版有 {last_good['count']} 个, "
                       f"为避免订阅变差保留上一版 (本轮检测服务异常 {len(svc_errors)} 次, 目标侧限流 {len(rate_limited)} 次)")
             return finish_degraded(session, reason, started, last_good=last_good, source=source,
-                                   rate_limited_ports=tripped, rate_limited_ports_detail=port_detail or None, **stats)
+                                   rate_limited_ports=tripped, port_429_detail=port_detail or None, **stats)
 
     data = build_outputs(results, raw_count, sstp_count, source)
     # 自动优选: 在生成节点行之前现取当轮优选 IP。超时/接口挂了会自动退回静态池
@@ -1581,7 +1587,7 @@ def main():
     if format_problems:
         reason = "生成的节点行未通过格式自检, 不发布 (可能是入口池配置异常): " + "; ".join(format_problems[:3])
         return finish_degraded(session, reason, started, last_good=last_good, source=source,
-                               rate_limited_ports=tripped, rate_limited_ports_detail=port_detail or None, **stats)
+                               rate_limited_ports=tripped, port_429_detail=port_detail or None, **stats)
 
     new_ok = 0
     if known_keys:
@@ -1604,7 +1610,7 @@ def main():
         worker_errors=len(worker_errors),
         rate_limited=len(rate_limited),
         failure_breakdown=breakdown,
-        rate_limited_ports=tripped, rate_limited_ports_detail=port_detail or None,
+        rate_limited_ports=tripped, port_429_detail=port_detail or None,
         new_nodes=new_ok,
         check_budget=CHECK_BUDGET or None,
         candidates=len(uniq),

@@ -160,8 +160,11 @@ EXPECT = {
                     "status_rate_limited_ports": [443], "port_detail_invariant": True,
                     "port_detail_expect": [{"port": 443, "candidates_in_source": 17, "candidates": 17}]},
         # 归因: 9 个 SSTP 节点全撞 429, 必须全部归到 target_ratelimit, 一个都不许算 node_dead
+        # 9 个 SSTP 节点端口各不相同、各撞一次 429, 不触发熔断 -> 正好用来守卫
+        # 「未熔断但出现 429 的端口也必须进 port_429_detail」(否则判不了阈值是否设太晚)
         "rl_breakdown": {"exit": 0, "nodes": 8, "status": "stale",
-                         "status_breakdown": {"target_ratelimit": 9, "node_dead": 0}},
+                         "status_breakdown": {"target_ratelimit": 9, "node_dead": 0},
+                         "port_detail_nonempty": True},
         # 10 个 SSTP 节点全部撞 403: 归 worker_error (非节点侧), 且不重试 -> 请求数 == 10。
         # 若误归 node_dead, status_breakdown.node_dead 会 > 0; 若重试, 请求数会是 30。
         "worker_http403": {"exit": 0, "nodes": 8, "status": "stale", "max_worker_requests": 10,
@@ -260,7 +263,7 @@ def run_case(target, scenario, extra_env):
         "status_worker_errors": (status or {}).get("worker_errors"),
         "status_breakdown": (status or {}).get("failure_breakdown"),
         "status_rate_limited_ports": (status or {}).get("rate_limited_ports"),
-        "status_port_detail": (status or {}).get("rate_limited_ports_detail"),
+        "status_port_detail": (status or {}).get("port_429_detail"),
         "worker_requests": worker_requests,
         "checked_hosts": sorted(set(checked_hosts)),
         "has_warning_annotation": "::warning::" in proc.stdout,
@@ -318,8 +321,11 @@ def check(expect, result):
                 continue
             if not isinstance(d.get("port"), int):
                 problems.append(f"rate_limited_ports_detail.port 应为 int, 实际 {type(d.get('port')).__name__} ({d.get('port')!r}) — JSON key 字符串化陷阱")
-            if d.get("candidates") != (d.get("probed_429") or 0) + (d.get("skipped") or 0):
-                problems.append(f"端口 {d.get('port')} 计数不守恒: candidates={d.get('candidates')} != probed_429={d.get('probed_429')} + skipped={d.get('skipped')}")
+            # 不变式 (守恒) 只在「该端口发生了熔断」时成立: 熔断后该端口所有候选要么被实测、
+            # 要么被跳过。未熔断的端口可能有成功节点或其它失败, candidates 会 > probed_429 + skipped。
+            if d.get("skipped"):
+                if d.get("candidates") != (d.get("probed_429") or 0) + (d.get("skipped") or 0):
+                    problems.append(f"端口 {d.get('port')} 计数不守恒: candidates={d.get('candidates')} != probed_429={d.get('probed_429')} + skipped={d.get('skipped')}")
             if not d.get("candidates"):
                 problems.append(f"端口 {d.get('port')} candidates 为 0, 无法判断是否过度误杀")
             # 截断关闭时 (CHECK_BUDGET=0) 两个口径应相等; 截断开启后 source >= planned
@@ -327,6 +333,17 @@ def check(expect, result):
                 problems.append(f"端口 {d.get('port')} 缺 candidates_in_source (无法判断是否整段误杀)")
             elif d.get("candidates_in_source") < d.get("candidates"):
                 problems.append(f"端口 {d.get('port')} candidates_in_source={d.get('candidates_in_source')} < candidates={d.get('candidates')} (源总数不可能小于计划检测数)")
+    if expect.get("port_detail_nonempty"):
+        # 扩展语义的守卫: 未触发熔断的端口, 只要出现 429, 也必须出现在 port_429_detail 里。
+        # 否则就退回「只在熔断时才记录」的老问题 —— 拿不到 candidates_in_source 就判不了阈值。
+        got = result["status_port_detail"] or []
+        if not got:
+            problems.append("port_429_detail 为空: 有 429 但没熔断的端口也应出现在 detail 里 (扩展语义未生效)")
+        for d in got:
+            if not isinstance(d.get("port"), int):
+                problems.append(f"port_429_detail.port 应为 int, 实际 {type(d.get('port')).__name__}")
+            if d.get("skipped") != 0:
+                problems.append(f"port_429_detail 出现 skipped={d.get('skipped')} (该场景不应有熔断端口)")
     if expect.get("port_detail_expect"):
         # 写死具体数值: 防止有人「优化」candidates_in_source 的统计来源
         # (比如改回用被 MAX_CHECK_NODES 截断后的 uniq 来算) 而断言仍然绿。

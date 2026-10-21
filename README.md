@@ -180,7 +180,7 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 | `TARGET_RL_RETRIES` | `0` | **目标侧限流（429）**的额外重试次数，默认 `0` —— 重试无效且会加剧限流 |
 | `PORT_CB_THRESHOLD` | `4` | 同一端口连续多少次目标侧限流后熔断该端口（本轮不再检测，额度让给其它端口） |
 | `CHECK_BUDGET` | `0` | 单轮最多检测多少个节点（`0` = 不限）。额度会优先给新节点与住宅型 |
-| `PREFER_NEW_NODES` | `1` | 检测额度优先给「上一版没有的新节点」+ 住宅型；置 `0` 关闭 |
+| `PREFER_NEW_NODES` | `1` | 检测额度优先给「上一版没有的新节点」+ 住宅型；置 `0` 关闭。⚠️ 副作用见下方说明 |
 | `GLOBAL_RL_RATIO` | `0.35` | 滑窗内目标侧限流占比超过该值 → 全局退避（放大请求间隔） |
 | `GLOBAL_RL_PAUSE` | `10` | 限流占比超过阈值 2 倍时的全局暂停（秒） |
 | `MERGE_LAST_GOOD` | `0` | 置 `1`：本轮通过的节点与上一版仍可用节点合并去重后一起发布 |
@@ -211,17 +211,17 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 | `failure_breakdown.target_ratelimit` | 目标侧限流**归因总数**（含熔断跳过，见下方警告） |
 | `failure_breakdown.target_ratelimit_probed` | 真实撞到 429 的**节点数**（不含熔断跳过）。默认 `TARGET_RL_RETRIES=0` 时等于请求次数；把该值调大后一个节点可能发多次请求，此字段仍按节点计 |
 | `failure_breakdown.node_dead` / `worker_error` | 节点真不通 / 检测服务异常（非节点侧） |
-| `rate_limited_ports` | 本轮被熔断的端口列表 |
-| `rate_limited_ports_detail` | 每个熔断端口的 `candidates` / `candidates_in_source` / `probed_429` / `skipped` |
-| `rate_limited_ports_detail[].candidates` | 该端口**本轮计划检测**的候选数 —— 受 `CHECK_BUDGET` / `MAX_CHECK_NODES` 截断影响，**不是数据源原始总数** |
-| `rate_limited_ports_detail[].candidates_in_source` | 该端口在**数据源里**的候选总数（截断前）。判断「是否整段误杀」要看这个 |
+| `rate_limited_ports` | 本轮被熔断的端口列表（只有 `skipped > 0` 的端口才在这里） |
+| `port_429_detail` | **所有出现 429 的端口**（含未触发熔断的），每项 `candidates` / `candidates_in_source` / `probed_429` / `skipped`；`skipped=0` 表示有 429 但未达熔断阈值 |
+| `port_429_detail[].candidates` | 该端口**本轮计划检测**的候选数 —— 受 `CHECK_BUDGET` / `MAX_CHECK_NODES` 截断影响，**不是数据源原始总数** |
+| `port_429_detail[].candidates_in_source` | 该端口在**数据源里**的候选总数（截断前）。判断「是否整段误杀」要看这个 |
 | `new_nodes` | 本轮新增可用节点数（上一版没有的） |
 
 > ⚠️ **读 `failure_breakdown` 别重复计数**：被端口熔断跳过的节点 `failure_kind` 同样是
 > `target_ratelimit`（它是「未测」，不是「不通」），所以
 > **`target_ratelimit` = 真撞 429 的数量 + 熔断跳过的数量**，二者是包含关系、不能相加。
 > 想看有几个节点真的撞到了 429，读 `target_ratelimit_probed`。
-> `rate_limited_ports_detail` 里对应端口（如 `port=443`）那一项的 `skipped`，是 `target_ratelimit` 的一部分，不是额外一拨。
+> `port_429_detail` 里对应端口（如 `port=443`）那一项的 `skipped`，是 `target_ratelimit` 的一部分，不是额外一拨。`skipped=0` 表示该端口出现了 429 但没触发熔断。
 > 读 `candidates` 时注意它已被 `CHECK_BUDGET` 截断，要看数据源里的真实规模读 `candidates_in_source`。
 >
 > **怎么判断熔断阈值（`PORT_CB_THRESHOLD`）合不合适**：看 `probed_429 : skipped` 的比值。
@@ -233,7 +233,7 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 > 但 `ordered[:budget]` 不截断，「谁排前面」对产物没有任何可观测影响，
 > 该轮只是又一次回归检查，**不能据此说排序功能已验证**。
 >
-> 注：`rate_limited_ports_detail` 是 **list-of-dict**（形如
+> 注：`port_429_detail` 是 **list-of-dict**（形如
 > `[{"port": 443, "candidates": 20, ...}]`），不是以端口为 key 的 dict ——
 > JSON 的 key 只能是字符串，写成 dict 会让消费方拿到 `"443"` 而不是 `443`。
 
@@ -277,16 +277,33 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 
 > **怎么看本轮到底发生了什么**：直接看 `status.json` 的 `failure_breakdown`
 > （`target_ratelimit` / `worker_error` / `node_dead` 三类分别多少个）、
-> `rate_limited_ports`（被熔断的端口）、`rate_limited_ports_detail`（每个被熔断端口的
-> 候选数 / 真撞 429 节点数 / 跳过数）、`new_nodes`（本轮新增可用节点数）。
+> `rate_limited_ports`（被熔断的端口）、`port_429_detail`（**所有出现 429 的端口**，
+> 含未熔断的：候选数 / 真撞 429 节点数 / 跳过数）、`new_nodes`（本轮新增可用节点数）。
 > 三类之和恒等于失败总数 —— 不对就是脚本的归因出 bug 了，日志里会有「失败归因计数不自洽」告警。
 >
 > ⚠️ **读 `failure_breakdown` 时别重复计数**：被端口熔断跳过的节点 `failure_kind` 也是
 > `target_ratelimit`（它是「未测」不是「不通」），所以
 > **`target_ratelimit` = 真撞 429 的节点数 + 熔断跳过的节点数**，两者是包含关系、不能相加。
 > 想看有几个节点真撞到了 429，读 `target_ratelimit_probed`。
-> 同理 `rate_limited_ports_detail` 里对应端口（如 `port=443`）那一项的 `skipped`，
-> 也是 `target_ratelimit` 的一部分，不是额外一拨。
+> 同理 `port_429_detail` 里对应端口（如 `port=443`）那一项的 `skipped`，
+> 也是 `target_ratelimit` 的一部分，不是额外一拨（`skipped=0` 表示有 429 但未达熔断阈值）。
+
+### `PREFER_NEW_NODES` 的固有副作用（启用前必读）
+
+把检测额度优先给「新节点」换来的是**新鲜度**，代价是**单节点检测成本上升**：
+
+- 新节点是上一版没验证过的，质量未知，**超时概率高于**已被验证过的老节点。
+- 2026-10-21 实测对比：`CHECK_BUDGET=60` 轮（新节点优先）`elapsed=103.6s / 60 个 = 1.73s/节点`；
+  全量轮 `duration_s` 总共 82.3s / 88 个（即使全算检测时间也只有 ≤0.94s/节点）。
+  即**单节点成本约 1.8 倍以上**。这 22s 的差异主要来自节点本身，不是 fetch 重试
+  （budget 轮 `duration_s 136.2 − elapsed 103.6 = 32.6s` 才是 fetch 重试的开销）。
+- 因此在 `CHECK_BUDGET` 生效（源规模 > budget）时，**总耗时可能不降反升**。
+  不要指望「设了 budget 就一定更快」。
+
+> ⚠️ **没测 ≠ 不可用**：被 `CHECK_BUDGET` / `MAX_CHECK_NODES` 截掉的节点**本轮完全没被检测**，
+> 它们的可用性是未知的，不能当成「确认不可用」。2026-10-21 那轮 83 个候选截到 60 个，
+> 成功 37；全量轮（88 个候选）成功 46 —— 差的 9 个里有约 6 个来自被截掉的 23 个，
+> 这是**估算**（按成功率外推），不是实测值。
 
 ### 关于「429 限流」与「节点不通」的区别（重要）
 两者都会被检测 Worker 判成 `success=false`，但含义完全不同：
@@ -320,7 +337,7 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 
 | 日期 | 版本 | 变更 |
 | :--- | :--- | :--- |
-| 2026-10-21 | v1.6.1 | **修复 `PREFER_NEW_NODES` 排序键写反**（写成「老节点优先」，与语义相反；`CHECK_BUDGET=0` 时不触发截断分支故一直未暴露）；`status.json` 增加 `target_ratelimit_probed` 与 `rate_limited_ports_detail`，以区分「限流 14」中的包含关系；`rate_limited_ports_detail` 采用 list-of-dict（`port` 为 int，避免 JSON key 字符串化）；测试新增 `budget_new_first` 场景 |
+| 2026-10-21 | v1.6.2 | **`port_429_detail` 记录范围扩展**：从「只记被熔断的端口」改为「所有出现 429 的端口 ∪ 熔断端口」，并同步更名（原名 `rate_limited_ports_detail` 是 `rate_limited_ports` 的附属，扩展后会含不在其中的端口，保留原名会误导）。原因：只记熔断端口会形成**反向激励** —— 越是「阈值可能设错了」的情况（限流缓解到没触发熔断）越拿不到 `candidates_in_source`，阈值就永远判不了。现在 `skipped=0` 表示「有 429 但未熔断」；`candidates` 与 `probed_429 + skipped` 的守恒只对已熔断端口成立。测试新增 `port_detail_nonempty` 守卫（`rl_breakdown` 场景：9 个端口各撞一次 429、不熔断，仍须进 detail）。README 补 `PREFER_NEW_NODES` 的固有副作用（新节点超时概率更高，单节点成本约 1.8 倍，设 budget 不一定更快）与「没测 ≠ 不可用」说明 |（写成「老节点优先」，与语义相反；`CHECK_BUDGET=0` 时不触发截断分支故一直未暴露）；`status.json` 增加 `target_ratelimit_probed` 与 `port_429_detail`，以区分「限流 14」中的包含关系；`port_429_detail` 采用 list-of-dict（`port` 为 int，避免 JSON key 字符串化）；测试新增 `budget_new_first` 场景 |
 | 2026-10-21 | v1.6.0 | **修复「抓不到新节点」**：失败三级归因（`target_ratelimit`/`worker_error`/`node_dead`），429 默认不重试；新增按端口自适应熔断（`PORT_CB_THRESHOLD`）+ 全局滑窗退避（`GLOBAL_RL_*`）；新增检测预算 `CHECK_BUDGET` 与「新节点/住宅型优先」（`PREFER_NEW_NODES`）；`status.json` 增加 `failure_breakdown`/`rate_limited_ports`/`new_nodes`；修复降级分支不写 `status.json` 的 bug（`failed` 时产物缺失导致误判「脚本没跑」）；测试新增 `port_cb`、`rl_breakdown`、`worker_http403` 三场景 |
 | 2026-10-12 | v1.5.1 | **配置修正**：本地实测 125 个静态优选域名（TCP 443 + `/cdn-cgi/trace` 双检），剔除 DNS 失效的 `cmcc.cc.cd:443`，入口池 125 → 124 个 |
 | 2026-10-12 | v1.5.0 | **行为变更（minor）**：新增 `OPTIMAL_API` 内置自动优选 —— 每轮运行从优选接口现取优选 IP 置于入口池首，支持 `off`/`0`/`none`/`false` 关闭；`filter_edge_hosts` 新增裸 IP 分支（只做 TCP 检测，不参与 DNS 污染判定）；`data.json` 新增 `optimal_api` 字段；`tests/run_tests.py` 回归环境设 `OPTIMAL_API=off` 保证离线可复现 |
