@@ -93,6 +93,24 @@ CHECK_BACKOFF = float(os.environ.get("CHECK_BACKOFF", "2"))            # 检测�
 CHECK_MIN_INTERVAL = float(os.environ.get("CHECK_MIN_INTERVAL", "0.25"))  # 请求最小间隔(秒), 防止打爆 Worker 上游额度
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))
+
+# --- 目标侧限流治理 (2026-10-21) -------------------------------------------
+# 实测结论: 检测 Worker 返回的 "Target /api/lookup request failed: HTTP/1.1 429"
+# 是「目标服务器对 Cloudflare 出口 IP 的限流」, 不是 Worker 上游额度问题。
+# 两轮重复测试: :443 端口 100% 返回 429, 非 443 端口(995/1250~1957)大多成功。
+# 因此 429 必须单独归类、默认不重试 —— 旧逻辑把它当成「检测服务异常」重试 2 次
+# (退避仅 2~5 秒), 对持续限流无效, 反而把请求量放大 3 倍、加剧限流。
+CHECK_BUDGET = max(0, int(os.environ.get("CHECK_BUDGET", "0")))             # 单轮最多检测多少个节点, 0=不限
+PORT_CB_THRESHOLD = max(1, int(os.environ.get("PORT_CB_THRESHOLD", "4")))   # 同一端口连续 N 次目标侧限流即熔断
+TARGET_RL_RETRIES = max(0, int(os.environ.get("TARGET_RL_RETRIES", "0")))   # 目标侧限流的额外重试次数, 默认 0
+GLOBAL_RL_WINDOW = float(os.environ.get("GLOBAL_RL_WINDOW", "60"))          # 全局退避滑窗(秒)
+GLOBAL_RL_RATIO = float(os.environ.get("GLOBAL_RL_RATIO", "0.35"))          # 滑窗内限流占比超过该值才全局退避
+GLOBAL_RL_PAUSE = float(os.environ.get("GLOBAL_RL_PAUSE", "10"))            # 全局暂停(秒)
+ADAPTIVE_MAX_INTERVAL = float(os.environ.get("ADAPTIVE_MAX_INTERVAL", "5")) # 请求最小间隔的自适应上限(秒)
+# 检测额度优先给「上一版没出现过的新节点」—— 直接对症「抓不到新节点」
+PREFER_NEW_NODES = os.environ.get("PREFER_NEW_NODES", "1") not in ("0", "off", "false", "False")
+# 合并发布: 本轮通过的节点 + 上一版仍可用节点。默认关闭 (不改变现有行为), 置 1 开启
+MERGE_LAST_GOOD = os.environ.get("MERGE_LAST_GOOD", "0") in ("1", "true", "True")
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
 STATUS_NAME = "status.json"
@@ -319,23 +337,47 @@ def classify_network(host, exit_org, is_datacenter=None):
 
 # 检测服务侧故障的特征 (Worker 上游限速/网关/内部错误) —— 这类失败要重试, 且不能算作「节点不通」
 _WORKER_TROUBLE_RE = re.compile(
-    r"(429|too many requests|rate.?limit|quota|lookup request failed|/api/lookup|"
+    r"(\b429\b|too many requests|rate.?limit|quota|lookup request failed|/api/lookup|"
     r"internal error|bad gateway|gateway time-?out|service unavailable|temporarily unavailable|"
     r"connection reset|econn|fetch failed|worker exceeded|exceeded cpu)",
     re.I,
 )
 # 节点侧故障的特征 ("SSTP server connection timed out" 等): 不重试, 属于节点真的不通
 _NODE_SIDE_RE = re.compile(r"^\s*SSTP\b", re.I)
+# 目标侧限流: 429 / too many requests / rate limit
+# 与「Worker 上游额度耗尽」区分开: 后者是 Worker 直接返回 HTTP 429, 属于服务异常、要重试;
+# 这里是 Worker 正常返回 200, 但 JSON 里的 error 说明「目标服务器把这次请求限流了」。
+# 实测该错误 100% 可复现 (两轮重复测试 :443 全灭), 重试只会加剧限流。
+# \b429\b: 加词边界, 避免把 "1429" / "4290" 这类数字子串误判成限流
+_TARGET_RL_RE = re.compile(r"(\b429\b|too many requests|rate.?limit)", re.I)
+
+
+def classify_failure(err):
+    """把失败原因分成三类, 决定「要不要重试」:
+
+      target_ratelimit  目标服务器限流 (429) —— 重试无效且会加剧限流, 默认不重试
+      worker_error      检测服务本身异常 (5xx / 网关 / 超时) —— 要重试
+      node_dead         节点真的不通 ("SSTP ..." 等) —— 不重试
+    """
+    text = str(err or "")
+    if not text:
+        return "node_dead"
+    if _NODE_SIDE_RE.search(text):
+        return "node_dead"
+    if _TARGET_RL_RE.search(text):
+        return "target_ratelimit"
+    if _WORKER_TROUBLE_RE.search(text):
+        return "worker_error"
+    return "node_dead"
 
 
 def is_worker_side_error(err):
-    """判断失败原因属于「检测服务本身出问题」还是「节点真的不通」。"""
-    if not err:
-        return False
-    text = str(err)
-    if _NODE_SIDE_RE.search(text):
-        return False
-    return bool(_WORKER_TROUBLE_RE.search(text))
+    """判断失败原因属于「不是节点的锅」(检测服务异常 或 目标侧限流) 还是「节点真的不通」。
+
+    保持旧语义: 只要不是节点侧故障就返回 True, 因此 status.worker_errors 的含义
+    (非节点侧失败计数) 不变; 需要区分 429 的地方请用 classify_failure()。
+    """
+    return classify_failure(err) != "node_dead"
 
 
 class RateLimiter:
@@ -357,7 +399,104 @@ class RateLimiter:
             time.sleep(sleep_for)
 
 
-def check_one(node, session, limiter=None):
+class PortCircuitBreaker:
+    """按端口熔断目标侧限流。
+
+    实测 :443 端口 100% 返回 429, 而非 443 端口大多可用。对这种「整个端口被限流」
+    的情况, 一个个试下去只是浪费额度 —— 连续 N 次之后本轮直接跳过该端口,
+    把检测额度让给其它端口。熔断只在本轮内有效, 下轮重新计数, 因此不会永久误杀
+    (443 哪天恢复可用了会自动重新参与检测)。
+    """
+
+    def __init__(self, threshold):
+        self.threshold = max(1, int(threshold))
+        self._lock = threading.Lock()
+        self._counts = {}
+        self._open = set()
+        self.skipped = 0
+
+    def record(self, port):
+        """记录一次目标侧限流; 返回 True 表示本次刚好触发熔断。"""
+        with self._lock:
+            n = self._counts.get(port, 0) + 1
+            self._counts[port] = n
+            if n >= self.threshold and port not in self._open:
+                self._open.add(port)
+                return True
+        return False
+
+    def is_open(self, port):
+        with self._lock:
+            return port in self._open
+
+    def skip(self):
+        """记录一次「因熔断而未发送」的请求。加锁: check_one 是多线程并发调用的。"""
+        with self._lock:
+            self.skipped += 1
+
+    def tripped(self):
+        with self._lock:
+            return sorted(self._open)
+
+
+class AdaptiveLimiter(RateLimiter):
+    """在「最小请求间隔」基础上加一层全局自适应退避。
+
+    两层保护:
+      1. 间隔自适应: 滑窗内目标侧限流占比升高 -> 请求间隔翻倍 (上限 ADAPTIVE_MAX_INTERVAL);
+         限流消失后逐步回落到基准值。
+      2. 全局暂停: 占比高于阈值的 2 倍 -> 整体暂停 GLOBAL_RL_PAUSE 秒, 防止把自己
+         的出口 IP 打进更长的封禁。
+    """
+
+    def __init__(self, interval, window=60.0, ratio=0.35, pause=10.0, max_interval=5.0):
+        super().__init__(interval)
+        self.base = max(0.0, float(interval))
+        self.window = max(1.0, float(window))
+        self.ratio = float(ratio)
+        self.pause = max(0.0, float(pause))
+        self.max_interval = max(self.base, float(max_interval))
+        self._ev_lock = threading.Lock()
+        self._events = []
+        self._pause_until = 0.0
+        self.pauses = 0
+        self.interval = self.base
+
+    def wait(self):
+        super().wait()
+        with self._ev_lock:
+            until = self._pause_until
+        if until > time.monotonic():
+            time.sleep(until - time.monotonic())
+
+    def note(self, kind):
+        """kind: 'ok' | 'target_ratelimit' | 'other'"""
+        with self._ev_lock:
+            now = time.monotonic()
+            cutoff = now - self.window
+            self._events = [e for e in self._events if e[0] >= cutoff]
+            self._events.append((now, kind))
+            total = len(self._events)
+            if total < 8:
+                return
+            rl = sum(1 for _, k in self._events if k == "target_ratelimit")
+            r = rl / total
+            if r > self.ratio * 2 and self.pause > 0:
+                if self._pause_until <= now:
+                    self.pauses += 1
+                self._pause_until = max(self._pause_until, now + self.pause)
+                self.interval = min(self.max_interval, max(self.base, self.interval * 2))
+            elif r > self.ratio:
+                self.interval = min(self.max_interval, max(self.base, self.interval * 2))
+            elif r < self.ratio / 2:
+                self.interval = max(self.base, self.interval / 2)
+
+    def snapshot(self):
+        with self._ev_lock:
+            return {"interval_s": round(self.interval, 3), "pauses": self.pauses}
+
+
+def check_one(node, session, limiter=None, breaker=None):
     url = WORKER_CHECK_URL + quote(f"{node['host']}:{node['port']}", safe="")
     out = dict(node)
     out["protocol"] = "sstp"
@@ -367,10 +506,26 @@ def check_one(node, session, limiter=None):
     out["exit"] = None
     out["residential"] = "unknown"
     out["worker_error"] = False
+    out["failure_kind"] = None
+    out["skipped_by_breaker"] = False
+
+    # 端口已熔断: 不发请求, 直接判「目标侧限流未测」—— 不发请求就不会加剧限流。
+    # 注意: 这是「未测」而不是「测过且不通」, 绝不能据此把节点判成质量差。
+    if breaker is not None and breaker.is_open(node["port"]):
+        breaker.skip()
+        out["skipped_by_breaker"] = True
+        out["failure_kind"] = "target_ratelimit"
+        # 必须置 worker_error=True: 它是「没测」, 不是「测过且节点不通」。
+        # 否则会同时落进 node_failed (not worker_error) 与 rate_limited, 导致两类计数之和 > 失败总数。
+        out["worker_error"] = True
+        out["error"] = f"端口 {node['port']} 已熔断 (连续 {breaker.threshold} 次目标侧限流), 本轮跳过检测"
+        out["attempts"] = 0
+        return out
 
     attempts = CHECK_RETRIES + 1
     last_error = "check failed"
     worker_side = False
+    kind = "node_dead"
     for attempt in range(1, attempts + 1):
         if limiter is not None:
             limiter.wait()
@@ -378,17 +533,17 @@ def check_one(node, session, limiter=None):
             r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
-            worker_side = True
+            kind = "worker_error"
         else:
             if r.status_code != 200:
                 last_error = f"HTTP {r.status_code}"
-                worker_side = r.status_code in (408, 425, 429, 500, 502, 503, 504)
+                kind = "worker_error" if r.status_code in (408, 425, 429, 500, 502, 503, 504) else "node_dead"
             else:
                 try:
                     j = r.json()
                 except Exception as exc:
                     last_error = f"响应不是合法 JSON: {type(exc).__name__}"
-                    worker_side = True
+                    kind = "worker_error"
                 else:
                     if j.get("success"):
                         out["success"] = True
@@ -405,14 +560,35 @@ def check_one(node, session, limiter=None):
                         else:
                             out["residential"] = classify_network(out["host"], None, None)
                         out["attempts"] = attempt
+                        if limiter is not None and hasattr(limiter, "note"):
+                            limiter.note("ok")
                         return out
-                    # Worker 正常返回但该节点不通: 也要区分是 Worker 侧问题还是节点侧问题
+                    # Worker 正常返回但该节点不通: 三类归因 (目标限流 / 服务异常 / 节点不通)
                     last_error = str(j.get("error") or j.get("message") or "check failed")
-                    worker_side = is_worker_side_error(last_error)
+                    kind = classify_failure(last_error)
                     out["colo"] = j.get("colo")
                     out["latency_ms"] = j.get("responseTime")
+        worker_side = kind != "node_dead"          # 非节点侧故障都计入 status.worker_errors
+        out["failure_kind"] = kind
         out["attempts"] = attempt
-        if worker_side and attempt < attempts:
+
+        if kind == "target_ratelimit":
+            # 目标服务器把我们限流了: 记入端口熔断 + 全局退避, 默认不重试。
+            # 重试只会再发一次请求、把限流窗口拉得更长, 对产出零收益。
+            if limiter is not None and hasattr(limiter, "note"):
+                limiter.note("target_ratelimit")
+            if breaker is not None and breaker.record(node["port"]):
+                log("CLOUDFLARE WORKER", f"  端口 {node['port']} 连续 {breaker.threshold} 次目标侧限流 -> 本轮熔断该端口, 额度让给其它端口")
+            if attempt <= TARGET_RL_RETRIES:
+                delay = max(CHECK_BACKOFF, GLOBAL_RL_PAUSE) * attempt + random.uniform(0, 1)
+                log("CLOUDFLARE WORKER", f"  目标侧限流 ({last_error[:60]}) -> {delay:.1f}s 后重试 {attempt}/{TARGET_RL_RETRIES}: {node['host']}:{node['port']}")
+                time.sleep(delay)
+                continue
+            break
+
+        if limiter is not None and hasattr(limiter, "note"):
+            limiter.note("other")
+        if kind == "worker_error" and attempt < attempts:
             delay = CHECK_BACKOFF * attempt + random.uniform(0, 1)
             log("CLOUDFLARE WORKER", f"  检测服务异常 ({last_error}) -> {delay:.1f}s 后重试 {attempt}/{CHECK_RETRIES}: {node['host']}:{node['port']}")
             time.sleep(delay)
@@ -426,14 +602,34 @@ def check_one(node, session, limiter=None):
     return out
 
 
-def check_all(nodes, session):
-    limiter = RateLimiter(CHECK_MIN_INTERVAL)
+def check_all(nodes, session, breaker=None):
+    limiter = AdaptiveLimiter(CHECK_MIN_INTERVAL, window=GLOBAL_RL_WINDOW, ratio=GLOBAL_RL_RATIO,
+                              pause=GLOBAL_RL_PAUSE, max_interval=ADAPTIVE_MAX_INTERVAL)
     results = []
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        futures = [pool.submit(check_one, n, session, limiter) for n in nodes]
+        futures = [pool.submit(check_one, n, session, limiter, breaker) for n in nodes]
         for fut in as_completed(futures):
             results.append(fut.result())
-    return results
+    return results, limiter
+
+
+def select_check_targets(nodes, known_keys=None, budget=0):
+    """在检测额度内挑选目标: 新节点优先, 其次住宅型 > 未知 > 机房型。
+
+    known_keys: 上一版已发布节点的 (host, port) 集合 —— 不在集合里的就是「新节点」。
+    budget: 单轮最多检测多少个, 0 = 不限。
+    """
+    ordered = list(nodes)
+    if PREFER_NEW_NODES and known_keys:
+        kind_rank = {"residential": 0, "unknown": 1, "datacenter": 2}
+        ordered.sort(key=lambda n: (
+            0 if (n["host"].lower(), n["port"]) in known_keys else 1,
+            kind_rank.get(classify_network(n["host"], ""), 1),
+            n["host"],
+        ))
+    if budget and len(ordered) > budget:
+        ordered = ordered[:budget]
+    return ordered
 
 # ---------------------------------------------------------------------------
 # 生成数据
@@ -999,6 +1195,63 @@ def load_last_good(session):
     return {"nodes_text": nodes_text, "data": data, "count": count_nodes(nodes_text)}
 
 
+def last_good_keys(last_good):
+    """从上一版 nodes.txt 解析出 (host, port) 集合, 用于识别「本轮新出现的节点」。"""
+    keys = set()
+    if not last_good:
+        return keys
+    for ln in (last_good.get("nodes_text") or "").splitlines():
+        ln = ln.strip()
+        if not ln or not NODE_LINE_RE.match(ln):
+            continue
+        hp = ln.rsplit("@", 1)[-1]
+        host, _, port = hp.rpartition(":")
+        if host and port.isdigit():
+            keys.add((host.lower(), int(port)))
+    return keys
+
+
+def carry_over_nodes(results, last_good):
+    """合并发布: 把上一版仍可用、本轮未验证失败的节点并入本轮结果。
+
+    只剔除本轮「确认节点不通」(node_dead) 的; 被限流未测 (target_ratelimit) 的
+    不算失败, 上一版若还在就继续保留 —— 限流不等于节点坏了。
+    """
+    if not last_good:
+        return []
+    data = last_good.get("data")
+    if not isinstance(data, dict):
+        return []
+    prev = data.get("available") or []
+    if not isinstance(prev, list):
+        return []
+
+    have = {(str(r.get("host") or "").lower(), r.get("port")) for r in results}
+    dead = {(str(r.get("host") or "").lower(), r.get("port"))
+            for r in results if not r.get("success") and r.get("failure_kind") == "node_dead"}
+
+    carried = []
+    for item in prev:
+        if not isinstance(item, dict):
+            continue
+        host = str(item.get("host") or "").strip()
+        port = item.get("port")
+        if not host or not isinstance(port, int):
+            continue
+        key = (host.lower(), port)
+        if key in have or key in dead:
+            continue
+        node = dict(item)
+        node.update({"host": host, "port": port, "success": True, "status": "success",
+                     "protocol": "sstp", "link": f"sstp://vpn:vpn@{host}:{port}",
+                     "worker_error": False, "failure_kind": None, "carried_over": True})
+        node.setdefault("country", item.get("country") or "")
+        node.setdefault("country_code", item.get("country_code") or "")
+        node.setdefault("residential", item.get("residential") or "unknown")
+        carried.append(node)
+    return carried
+
+
 def publish_last_good(last_good, status):
     """把上一版产物写进 public/, 保证 edgetunnel 订阅不中断。"""
     os.makedirs(PUBLIC_DIR, exist_ok=True)
@@ -1077,9 +1330,18 @@ def log_diagnostics(status):
         print(f"  端点体检    : {es['alive']}/{es['total']} 正常" + (f" — 异常: {', '.join(es['abnormal_urls'])}" if es.get("abnormal") else ""))
     stats = status.get("stats") or {}
     if stats:
-        print("  本轮统计    : " + ", ".join(f"{k}={v}" for k, v in stats.items()))
+        print("  本轮统计    : " + ", ".join(f"{k}={v}" for k, v in stats.items() if k != "failure_breakdown"))
+    bd = status.get("failure_breakdown") or {}
+    if bd:
+        print(f"  失败归因    : 目标侧限流未测 {bd.get('target_ratelimit', 0)} / 检测服务异常 {bd.get('worker_error', 0)} / 节点不通 {bd.get('node_dead', 0)}")
+    if status.get("rate_limited_ports"):
+        print(f"  熔断端口    : {', '.join(str(p) for p in status['rate_limited_ports'])} (本轮未测, 不是确认不通)")
+    if status.get("new_nodes"):
+        print(f"  新节点      : 本轮新增可用 {status['new_nodes']} 个 (上一版没有的)")
     if status.get("worker_errors"):
-        print(f"  检测服务异常: {status['worker_errors']} 次 (Worker 上游限速/网关问题, 不是节点不通)")
+        # 注意: status.worker_errors 是「非节点侧失败」的旧口径 (含目标侧限流),
+        # 这里优先展示细分归因, 避免把「限流未测」误读成「检测服务坏了」。
+        print(f"  检测服务异常: {bd.get('worker_error', status['worker_errors'])} 次")
     print(f"  耗时        : {status['duration_s']}s")
     print(f"  订阅地址    : {NODES_URL}")
 
@@ -1100,6 +1362,15 @@ def finish_degraded(session, reason, started, last_good=None, **stats):
         status = build_status("failed", reason, started, **stats)
         log("FATAL", "既没有新数据, 也拿不到上一版产物 — 不发布空订阅, 本次运行判定失败 (线上站点保持原样)")
         print(f"::error::{reason}", flush=True)
+        # 修复 (2026-10-21): 以前这条分支只 build 了 status 却没落盘, public/status.json 直接缺失,
+        # Actions 的「运行结果汇总」会打印「脚本在生成产物前就退出了」, 把人往错误的方向带。
+        # 失败也必须留下结论, 否则没法区分「脚本没跑」和「跑了但没得发」。
+        try:
+            os.makedirs(PUBLIC_DIR, exist_ok=True)
+            write_json(os.path.join(PUBLIC_DIR, STATUS_NAME), status)
+            log("FALLBACK", f"已写入 {STATUS_NAME} (outcome=failed), 便于排查")
+        except Exception as exc:
+            log("FALLBACK", f"写入 {STATUS_NAME} 失败: {type(exc).__name__}: {exc}")
     log_diagnostics(status)
     if status["outcome"] == "stale" and not STRICT:
         return 0
@@ -1160,47 +1431,90 @@ def main():
     if MAX_CHECK_NODES > 0:
         uniq = uniq[:MAX_CHECK_NODES]
 
-    log("VPN GATE", f"原始节点 {raw_count} / SSTP {sstp_count} / 去重后 {len(uniq)} (来源 {source})")
-    log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s, 服务异常重试 {CHECK_RETRIES} 次)")
+    # 上一版产物: 既用于识别「本轮新出现的节点」, 也用于降级与合并发布
+    last_good = load_last_good(session) if (PREFER_NEW_NODES or MERGE_LAST_GOOD) else None
+    known_keys = last_good_keys(last_good)
+    new_candidates = sum(1 for n in uniq if (n["host"].lower(), n["port"]) not in known_keys) if known_keys else 0
 
+    selected = select_check_targets(uniq, known_keys or None, CHECK_BUDGET)
+    log("VPN GATE", f"原始节点 {raw_count} / SSTP {sstp_count} / 去重后 {len(uniq)} (来源 {source})")
+    if known_keys:
+        log("VPN GATE", f"其中新节点 {new_candidates} 个 (上一版 {len(known_keys)} 个已知)" + (" -> 新节点优先占用检测额度" if PREFER_NEW_NODES else ""))
+    if CHECK_BUDGET and len(selected) < len(uniq):
+        log("VPN GATE", f"检测预算 CHECK_BUDGET={CHECK_BUDGET}: 只检测 {len(selected)}/{len(uniq)} 个")
+    log("CLOUDFLARE WORKER", f"提交检测: {len(selected)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s, 服务异常重试 {CHECK_RETRIES} 次, 目标限流重试 {TARGET_RL_RETRIES} 次)")
+
+    breaker = PortCircuitBreaker(PORT_CB_THRESHOLD)
     t0 = time.time()
-    results = check_all(uniq, session)
+    results, limiter = check_all(selected, session, breaker=breaker)
     elapsed = time.time() - t0
+    checked_count = len(results)
+
+    tripped = breaker.tripped()
+    if tripped:
+        warn(f"目标侧限流熔断端口: {', '.join(str(p) for p in tripped)} (共跳过 {breaker.skipped} 个节点) "
+             f"— 这些节点本轮「未测」, 不是确认不通")
+    throttle_state = limiter.snapshot() if hasattr(limiter, "snapshot") else {}
+    if throttle_state.get("pauses"):
+        log("CLOUDFLARE WORKER", f"全局自适应退避触发 {throttle_state['pauses']} 次, 当前请求间隔 {throttle_state.get('interval_s')}s")
 
     success = [r for r in results if r.get("success")]
     failed = [r for r in results if not r.get("success")]
     worker_errors = [r for r in failed if r.get("worker_error")]
     node_failed = [r for r in failed if not r.get("worker_error")]
+    rate_limited = [r for r in failed if r.get("failure_kind") == "target_ratelimit"]
+    svc_errors = [r for r in failed if r.get("failure_kind") == "worker_error"]
+
+    if MERGE_LAST_GOOD:
+        carried = carry_over_nodes(results, last_good)
+        if carried:
+            log("MERGE", f"合并发布: 并入上一版仍可用的 {len(carried)} 个节点 (本轮未覆盖/未被确认不通)")
+            results = results + carried
+            success = [r for r in results if r.get("success")]
+
+    breakdown = {"target_ratelimit": len(rate_limited), "worker_error": len(svc_errors),
+                 "node_dead": len(node_failed), "breaker_skipped": breaker.skipped}
+    # 自检: 三类归因必须恰好等于失败总数, 出现重复计数/漏计立刻暴露
+    if sum(breakdown[k] for k in ("target_ratelimit", "worker_error", "node_dead")) != len(failed):
+        log("CLOUDFLARE WORKER", f"  警告: 失败归因计数不自洽 {breakdown} vs 失败总数 {len(failed)}")
 
     log("CLOUDFLARE WORKER", f"检测成功: {len(success)}")
-    log("CLOUDFLARE WORKER", f"检测失败: {len(failed)} (节点侧不通 {len(node_failed)}, 检测服务异常 {len(worker_errors)})")
+    log("CLOUDFLARE WORKER", f"检测失败: {len(failed)} (节点侧不通 {len(node_failed)}, 检测服务异常 {len(svc_errors)}, 目标侧限流未测 {len(rate_limited)})")
     log("CLOUDFLARE WORKER", f"耗时: {elapsed:.1f}s")
 
     stats = {
         "raw_nodes": raw_count,
         "sstp_nodes": sstp_count,
-        "checked": len(results),
+        "checked": checked_count,
         "success": len(success),
         "node_failed": len(node_failed),
         "worker_errors": len(worker_errors),
+        "rate_limited": len(rate_limited),
+        "failure_breakdown": breakdown,
     }
 
     if not success:
-        if worker_errors and len(worker_errors) == len(results):
+        if rate_limited and len(rate_limited) == len(results):
+            reason = (f"本轮所有节点都被目标服务器限流 (429, 共 {len(rate_limited)} 个) — 不是节点不通, "
+                      f"是目标侧对 Cloudflare 出口 IP 限速; 已在 status.json.failure_breakdown 中单列")
+        elif worker_errors and len(worker_errors) == len(results):
             reason = f"检测服务全部异常 (共 {len(worker_errors)} 个请求失败, 典型原因: {top_error(worker_errors)}) — 不是节点问题"
-        elif worker_errors:
-            reason = (f"本轮无可用节点: 节点侧不通 {len(node_failed)} 个, 检测服务异常 {len(worker_errors)} 个 "
-                      f"(典型原因: {top_error(failed)})")
+        elif worker_errors or rate_limited:
+            reason = (f"本轮无可用节点: 节点侧不通 {len(node_failed)} 个, 检测服务异常 {len(svc_errors)} 个, "
+                      f"目标侧限流 {len(rate_limited)} 个 (典型原因: {top_error(failed)})")
         else:
             reason = f"本轮所有节点都检测不通 ({len(node_failed)} 个, 典型原因: {top_error(node_failed)})"
-        return finish_degraded(session, reason, started, source=source, **stats)
+        return finish_degraded(session, reason, started, last_good=last_good, source=source,
+                               rate_limited_ports=tripped, **stats)
 
     if len(success) < MIN_SUCCESS:
-        last_good = load_last_good(session)
+        if last_good is None:
+            last_good = load_last_good(session)
         if last_good and last_good["count"] > len(success):
             reason = (f"本轮只有 {len(success)} 个可用节点 (< MIN_SUCCESS={MIN_SUCCESS}), 上一版有 {last_good['count']} 个, "
-                      f"为避免订阅变差保留上一版 (本轮检测服务异常 {len(worker_errors)} 次)")
-            return finish_degraded(session, reason, started, last_good=last_good, source=source, **stats)
+                      f"为避免订阅变差保留上一版 (本轮检测服务异常 {len(svc_errors)} 次, 目标侧限流 {len(rate_limited)} 次)")
+            return finish_degraded(session, reason, started, last_good=last_good, source=source,
+                                   rate_limited_ports=tripped, **stats)
 
     data = build_outputs(results, raw_count, sstp_count, source)
     # 自动优选: 在生成节点行之前现取当轮优选 IP。超时/接口挂了会自动退回静态池
@@ -1215,15 +1529,35 @@ def main():
     format_problems = validate_nodes_text(nodes_text)
     if format_problems:
         reason = "生成的节点行未通过格式自检, 不发布 (可能是入口池配置异常): " + "; ".join(format_problems[:3])
-        return finish_degraded(session, reason, started, source=source, **stats)
+        return finish_degraded(session, reason, started, last_good=last_good, source=source,
+                               rate_limited_ports=tripped, **stats)
+
+    new_ok = 0
+    if known_keys:
+        new_ok = sum(1 for r in success if (str(r.get("host") or "").lower(), r.get("port")) not in known_keys)
+    if rate_limited:
+        fresh_reason = f"正常更新 (目标侧限流未测 {len(rate_limited)} 个, 检测服务异常 {len(svc_errors)} 次)"
+        if tripped:
+            fresh_reason += f"; 已熔断端口 {', '.join(str(p) for p in tripped)}"
+    elif worker_errors:
+        fresh_reason = f"正常更新 (检测服务异常 {len(svc_errors)} 次)"
+    else:
+        fresh_reason = "正常更新"
 
     status = build_status(
         "fresh",
-        f"正常更新 (检测服务异常 {len(worker_errors)} 次)" if worker_errors else "正常更新",
+        fresh_reason,
         started,
         source=source,
         stats=data["stats"],
         worker_errors=len(worker_errors),
+        rate_limited=len(rate_limited),
+        failure_breakdown=breakdown,
+        rate_limited_ports=tripped,
+        new_nodes=new_ok,
+        check_budget=CHECK_BUDGET or None,
+        candidates=len(uniq),
+        carried_over=sum(1 for r in success if r.get("carried_over")),
     )
     paths = write_outputs(data, status, nodes_text)
 

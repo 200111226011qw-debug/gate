@@ -20,7 +20,8 @@ NODE_LINE_RE = re.compile(
 
 ROOT = Path(__file__).resolve().parent.parent
 TESTS = ROOT / "tests"
-RUNS = TESTS / "runs"
+# TEST_RUNS_DIR: 换一个全新的空目录即可跳过 rmtree (沙箱环境对批量删除有限制时很有用)
+RUNS = Path(os.environ["TEST_RUNS_DIR"]) if os.environ.get("TEST_RUNS_DIR") else (TESTS / "runs")
 
 
 def _first_existing(*paths):
@@ -63,6 +64,8 @@ BASE_ENV = {
     "DATA_URL": "https://last.good/gate/data.json",
     # 关闭内置自动优选: 回归必须全程离线可复现, 且入口池固定才能比对产物
     "OPTIMAL_API": "off",
+    # 全局退避暂停在回归里压到 0.5s, 避免测试套件被限流退避拖慢 (生产默认 10s)
+    "GLOBAL_RL_PAUSE": "0.5",
     "FAKE_NODES": "12",
     "FAKE_DELAY": "0.001",
     "PYTHONIOENCODING": "utf-8",
@@ -78,6 +81,9 @@ SCENARIOS = [
     ("mirror_only", "官方 API 挂, 走 GitHub 镜像", {"FAKE_PRIMARY": "http500"}),
     ("csv_spaced_header", "官方 CSV 表头带空格 + 数据行带 * 前缀 (解析器容错)", {"FAKE_CSV_STYLE": "spaced"}),
     ("partial_429", "部分节点可用、部分撞 429 上游限速", {"FAKE_WORKER": "partial_429", "MIN_SUCCESS": "1"}),
+    ("port_cb", "整个端口被目标侧限流 (:443 全灭) —— 端口熔断后额度让给其它端口",
+     {"FAKE_WORKER": "all429", "FAKE_SAME_PORT": "443", "FAKE_NODES": "20", "PORT_CB_THRESHOLD": "4"}),
+    ("rl_breakdown", "目标侧限流必须单列归因, 不能混进「节点不通」", {"FAKE_WORKER": "all429", "FAKE_NODES": "10"}),
     ("worker_config_empty", "CHECK_WORKER 未配置 (secrets.DOMAIN 缺失/被清空)", {"CHECK_WORKER": ""}),
     ("low_success", "只有 2 个节点可用 (< MIN_SUCCESS)", {"FAKE_WORKER": "mixed_low"}),
     ("no_lastgood", "数据源全挂 + 没有上一版产物", {"FAKE_PRIMARY": "timeout", "FAKE_MIRROR": "timeout", "FAKE_LASTGOOD": "missing"}),
@@ -99,21 +105,40 @@ EXPECT = {
                                 "bug": "Worker 地址为空 -> 每个请求瞬时异常, 秒级退出 1"},
         "low_success": {"exit": 0, "nodes": 2, "bug": "只有 2 个节点也照发, 订阅被改差"},
         "no_lastgood": {"exit": 1, "nodes": None},
+        # 以下 2 个场景是 2026-10-21 新增的治理能力, 原版没有, 因此原版预期为「照旧滥发请求」
+        "port_cb": {"exit": 0, "nodes": 8, "min_worker_requests": 20,
+                    "bug": "不会按端口熔断 -> 20 个节点全打一遍, 全部撞 429"},
+        "rl_breakdown": {"exit": 0, "nodes": 8, "min_worker_requests": 10,
+                         "bug": "429 被当成节点不通, 归因与「节点真不通」混为一谈"},
     },
     "fixed": {
         # 加固版: 能用上一版就用上一版 (退出码 0), 只有彻底无内容可发布才退出 1
         "ci_real_env": {"exit": 0, "nodes": ("gt", 0), "status": "fresh"},
         "happy": {"exit": 0, "nodes": ("gt", 0), "status": "fresh"},
-        "worker_429_all": {"exit": 0, "nodes": 8, "status": "stale", "min_worker_requests": 25},
+        # worker_429_all: 12 个节点端口各不相同, 每个端口只失败 1 次 -> 不会触发端口熔断,
+        # 但 429 属于「目标侧限流」, 默认不重试 (TARGET_RL_RETRIES=0), 因此请求数从
+        # 旧的 36 次 (12×3) 降到 12 次。改这条预期的原因见 vpngate.py 顶部注释:
+        # 旧逻辑把 429 当「检测服务异常」重试 2 次, 实测对持续限流无效且会加剧限流。
+        "worker_429_all": {"exit": 0, "nodes": 8, "status": "stale", "max_worker_requests": 10,
+                           "status_breakdown": {"target_ratelimit": 10}},
         "worker_503_all": {"exit": 0, "nodes": 8, "status": "stale", "min_worker_requests": 25},
         "sources_down": {"exit": 0, "nodes": 8, "status": "stale"},
         "mirror_only": {"exit": 0, "nodes": ("gt", 0), "status": "fresh"},
         "csv_spaced_header": {"exit": 0, "nodes": ("gt", 0), "status": "fresh", "source_contains": "vpngate.net"},
-        "partial_429": {"exit": 0, "nodes": 4, "status": "fresh", "min_worker_requests": 12,
+        # 10 个 SSTP 节点: 4 成功 + 2 撞 429 + 4 节点不通。
+        # 若 429 仍被重试 (旧行为) 请求数会是 4 + 2×3 + 4 = 14; 现在应为 10 —— 这条断言
+        # 用来锁死「目标侧限流不重试」, 一旦有人把它塞回重试链就会在这里失败。
+        "partial_429": {"exit": 0, "nodes": 4, "status": "fresh", "max_worker_requests": 10,
                         "min_status_worker_errors": 1},
         "worker_config_empty": {"exit": 0, "nodes": 8, "status": "stale", "max_seconds": 10},
         "low_success": {"exit": 0, "nodes": 8, "status": "stale"},
         "no_lastgood": {"exit": 1, "nodes": None},
+        # 端口熔断: 20 个节点全在 :443, 连续 4 次 429 后熔断 -> 请求数必须明显少于 20
+        "port_cb": {"exit": 0, "nodes": 8, "status": "stale", "max_worker_requests": 16,
+                    "status_rate_limited_ports": [443]},
+        # 归因: 9 个 SSTP 节点全撞 429, 必须全部归到 target_ratelimit, 一个都不许算 node_dead
+        "rl_breakdown": {"exit": 0, "nodes": 8, "status": "stale",
+                         "status_breakdown": {"target_ratelimit": 9, "node_dead": 0}},
     },
 }
 
@@ -189,6 +214,8 @@ def run_case(target, scenario, extra_env):
         "status_reason": (status or {}).get("reason"),
         "status_source": (status or {}).get("source"),
         "status_worker_errors": (status or {}).get("worker_errors"),
+        "status_breakdown": (status or {}).get("failure_breakdown"),
+        "status_rate_limited_ports": (status or {}).get("rate_limited_ports"),
         "worker_requests": worker_requests,
         "has_warning_annotation": "::warning::" in proc.stdout,
         "stdout_tail": proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else "",
@@ -220,6 +247,17 @@ def check(expect, result):
         problems.append(f"status.outcome={result['status_outcome']} != 期望 {expect['status']}")
     if expect.get("min_worker_requests") and result["worker_requests"] < expect["min_worker_requests"]:
         problems.append(f"Worker 请求数 {result['worker_requests']} < 期望 >= {expect['min_worker_requests']} (重试未生效)")
+    if expect.get("max_worker_requests") is not None and result["worker_requests"] > expect["max_worker_requests"]:
+        problems.append(f"Worker 请求数 {result['worker_requests']} > 期望 <= {expect['max_worker_requests']} (429 未生效治理, 仍在滥发请求)")
+    if expect.get("status_breakdown"):
+        got = result["status_breakdown"] or {}
+        for k, v in expect["status_breakdown"].items():
+            if got.get(k) != v:
+                problems.append(f"status.failure_breakdown.{k}={got.get(k)} != 期望 {v}")
+    if expect.get("status_rate_limited_ports") is not None:
+        got = result["status_rate_limited_ports"] or []
+        if list(expect["status_rate_limited_ports"]) != list(got):
+            problems.append(f"status.rate_limited_ports={got} != 期望 {expect['status_rate_limited_ports']}")
     if expect.get("min_status_worker_errors") and (result["status_worker_errors"] or 0) < expect["min_status_worker_errors"]:
         problems.append(f"status.worker_errors={result['status_worker_errors']} < 期望 >= {expect['min_status_worker_errors']} (429 未被识别为检测服务异常)")
     if expect.get("source_contains") and expect["source_contains"] not in (result["status_source"] or ""):

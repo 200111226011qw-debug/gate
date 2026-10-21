@@ -176,8 +176,14 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 | `CHECK_WORKER` | 无（必填） | 检测 Worker，形如 `https://xxx/check?sstp=vpn:vpn@`（Actions 里来自 `secrets.DOMAIN`） |
 | `CHECK_CONCURRENCY` | `4` | 检测并发。**不要调大**：Worker 上游有免费额度，32 并发会大面积 429 |
 | `CHECK_TIMEOUT` | `60` | 单次检测超时（秒） |
-| `CHECK_RETRIES` | `2` | 检测服务异常（429/5xx/超时）时的额外重试次数 |
-| `CHECK_BACKOFF` | `2` | 重试退避基数（秒），线性增长 + 抖动 |
+| `CHECK_RETRIES` | `2` | **检测服务异常**（5xx/网关/超时）时的额外重试次数 |
+| `TARGET_RL_RETRIES` | `0` | **目标侧限流（429）**的额外重试次数，默认 `0` —— 重试无效且会加剧限流 |
+| `PORT_CB_THRESHOLD` | `4` | 同一端口连续多少次目标侧限流后熔断该端口（本轮不再检测，额度让给其它端口） |
+| `CHECK_BUDGET` | `0` | 单轮最多检测多少个节点（`0` = 不限）。额度会优先给新节点与住宅型 |
+| `PREFER_NEW_NODES` | `1` | 检测额度优先给「上一版没有的新节点」+ 住宅型；置 `0` 关闭 |
+| `GLOBAL_RL_RATIO` | `0.35` | 滑窗内目标侧限流占比超过该值 → 全局退避（放大请求间隔） |
+| `GLOBAL_RL_PAUSE` | `10` | 限流占比超过阈值 2 倍时的全局暂停（秒） |
+| `MERGE_LAST_GOOD` | `0` | 置 `1`：本轮通过的节点与上一版仍可用节点合并去重后一起发布 |
 | `FETCH_RETRIES` | `3` | 每个数据源的抓取重试次数 |
 | `MIN_SUCCESS` | `5` | 可用节点少于该值时，若上一版更多则保留上一版 |
 | `KEEP_LAST_GOOD` | `1` | 置 `0` 关闭「沿用上一版产物」的降级能力 |
@@ -208,7 +214,8 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 6. **发布前产物自检**：`validate_nodes_text()` 逐行校验 `nodes.txt`（入口与节点主机必须是域名），格式不合格就**拒绝发布**并降级沿用上一版 —— 防止「运行绿色但订阅是坏的」（2026-10-07 踩过这个坑：入口池被按字符拆开，每行入口变成单个字母，而当时测试只数行数）。
 7. **入口池解析**：`_env_csv()` 统一读取「逗号分隔」配置，**返回条目列表**，调用方不需要（也无法忘记）`.split(",")`。
 
-> 想本地验证这些行为（无需联网）：`python tests/run_tests.py`（18 组故障场景，对比加固前后）。
+> 想本地验证这些行为（无需联网）：`python tests/run_tests.py`（13 组故障场景）。
+> 沙箱环境若因批量删除被拦，换一个空的运行目录即可：`TEST_RUNS_DIR=tests/runs_v2 python tests/run_tests.py`。
 
 ---
 
@@ -230,9 +237,28 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 
 ### 运行是绿的，但节点没换（`status.json` 里 `outcome=stale`）
 说明本轮没产出新数据，沿用了上一版。看 `reason` 字段：
-- `检测服务全部异常 ... 429` → Worker 上游额度被打满。加固版已把并发降到 4 并自动重试；若仍然如此，说明 Worker 自身的上游额度/密钥需要处理（到 Cloudflare 看 Worker 日志）。
+- `本轮所有节点都被目标服务器限流 (429 ...)` → **目标服务器把我们的出口 IP 限速了**，不是节点不通。已在 `failure_breakdown.target_ratelimit` 单列。脚本会自动按端口熔断、省下额度给其它端口；若长期这样，说明该批目标确实在限流 Cloudflare 出口，等下一轮换一批节点即可。
+- `检测服务全部异常 ...` → Worker 上游额度被打满。并发已降到 4 并自动重试；若仍然如此，到 Cloudflare 看 Worker 日志。
 - `所有数据源都不可用` → VPN Gate 官方 API 与镜像同时挂了，等下一轮即可。
 - `CHECK_WORKER 未配置或非法` → 仓库 Secrets 里的 `DOMAIN` 丢了，重新设置成 `https://你的Worker域名/check?sstp=vpn:vpn@`。
+
+> **怎么看本轮到底发生了什么**：直接看 `status.json` 的 `failure_breakdown`
+> （`target_ratelimit` / `worker_error` / `node_dead` 三类分别多少个）、
+> `rate_limited_ports`（被熔断的端口）、`new_nodes`（本轮新增可用节点数）。
+> 三类之和恒等于失败总数 —— 不对就是脚本的归因出 bug 了，日志里会有「失败归因计数不自洽」告警。
+
+### 关于「429 限流」与「节点不通」的区别（重要）
+两者都会被检测 Worker 判成 `success=false`，但含义完全不同：
+
+| 现象 | 含义 | 脚本处理 |
+| :--- | :--- | :--- |
+| `Target /api/lookup request failed: HTTP/1.1 429` | 目标服务器限流，**没测成**，不是节点的锅 | 归为 `target_ratelimit`，默认**不重试**；同一端口连续 4 次即熔断本轮该端口 |
+| `SSTP server connection timed out` | 节点真的不通 | 归为 `node_dead`，不重试 |
+| `HTTP 408/425/429/5xx` | 检测服务瞬时故障或上游限流 | 归为 `worker_error`，按 `CHECK_RETRIES` 重试 |
+
+> 2026-10-21 实测：`:443` 端口 100% 返回 429（两轮重复测试无一例外），非 443 端口大多正常。
+> 旧版把 429 当成「检测服务异常」重试 2 次（退避仅 2~5 秒），对持续限流毫无作用，
+> 反而把请求量放大 3 倍、加剧限流 —— 这是「抓不到新节点」的真正原因。
 
 ### 检测 Worker 报错 / 大面积成功率为 0
 浏览器直接打开 `https://你的Worker/check?sstp=vpn:vpn@任意节点:端口` 看返回的 JSON：
@@ -252,6 +278,7 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 
 | 日期 | 版本 | 变更 |
 | :--- | :--- | :--- |
+| 2026-10-21 | v1.6.0 | **修复「抓不到新节点」**：失败三级归因（`target_ratelimit`/`worker_error`/`node_dead`），429 默认不重试；新增按端口自适应熔断（`PORT_CB_THRESHOLD`）+ 全局滑窗退避（`GLOBAL_RL_*`）；新增检测预算 `CHECK_BUDGET` 与「新节点/住宅型优先」（`PREFER_NEW_NODES`）；`status.json` 增加 `failure_breakdown`/`rate_limited_ports`/`new_nodes`；修复降级分支不写 `status.json` 的 bug（`failed` 时产物缺失导致误判「脚本没跑」）；测试新增 `port_cb`、`rl_breakdown` 两场景 |
 | 2026-10-12 | v1.5.1 | **配置修正**：本地实测 125 个静态优选域名（TCP 443 + `/cdn-cgi/trace` 双检），剔除 DNS 失效的 `cmcc.cc.cd:443`，入口池 125 → 124 个 |
 | 2026-10-12 | v1.5.0 | **行为变更（minor）**：新增 `OPTIMAL_API` 内置自动优选 —— 每轮运行从优选接口现取优选 IP 置于入口池首，支持 `off`/`0`/`none`/`false` 关闭；`filter_edge_hosts` 新增裸 IP 分支（只做 TCP 检测，不参与 DNS 污染判定）；`data.json` 新增 `optimal_api` 字段；`tests/run_tests.py` 回归环境设 `OPTIMAL_API=off` 保证离线可复现 |
 

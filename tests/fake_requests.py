@@ -70,7 +70,9 @@ def _nodes():
         host = f"vpn{100000000 + i}"
         country, code = countries[i % len(countries)]
         proto = "udp" if i % 6 == 5 else "tcp"          # 每 6 个里有 1 个不是 TCP -> 应被过滤掉
-        port = 443 + i
+        # FAKE_SAME_PORT: 让所有节点共用一个端口, 用于复现「整个端口被目标侧限流」的场景
+        # (生产环境 2026-10-21 实测: :443 端口 100% 返回 429)
+        port = int(os.environ["FAKE_SAME_PORT"]) if os.environ.get("FAKE_SAME_PORT") else 443 + i
         out.append({
             "hostname": host,
             "ip": f"10.0.{i // 250}.{i % 250}",
