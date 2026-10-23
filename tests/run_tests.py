@@ -79,6 +79,7 @@ SCENARIOS = [
     ("worker_503_all", "检测 Worker 全部 503", {"FAKE_WORKER": "http503"}),
     ("sources_down", "两个数据源都不可用", {"FAKE_PRIMARY": "timeout", "FAKE_MIRROR": "timeout"}),
     ("mirror_only", "官方 API 挂, 走 GitHub 镜像", {"FAKE_PRIMARY": "http500"}),
+    ("mirror_404", "镜像 404 不重试 (URL 配错快速失败, 与 4xx 不重试口径一致)", {"FAKE_PRIMARY": "http500", "FAKE_MIRROR": "http404"}),
     ("csv_spaced_header", "官方 CSV 表头带空格 + 数据行带 * 前缀 (解析器容错)", {"FAKE_CSV_STYLE": "spaced"}),
     ("partial_429", "部分节点可用、部分撞 429 上游限速", {"FAKE_WORKER": "partial_429", "MIN_SUCCESS": "1"}),
     ("port_cb", "整个端口被目标侧限流 (:443 全灭) —— 端口熔断后额度让给其它端口",
@@ -106,6 +107,8 @@ EXPECT = {
         "worker_503_all": {"exit": 1, "nodes": None, "bug": "Worker 全 503 -> 整轮判失败"},
         "sources_down": {"exit": 1, "nodes": None, "bug": "数据源抖动 -> 整轮判失败"},
         "mirror_only": {"exit": 0, "nodes": ("gt", 0)},
+        "mirror_404": {"exit": 1, "nodes": None, "min_mirror_requests": 2,
+                       "bug": "数据源全挂 -> 整轮判失败; 且 404 也吃满重试次数 (2 次), 白等一轮退避"},
         "csv_spaced_header": {"exit": 0, "nodes": ("gt", 0)},
         "partial_429": {"exit": 0, "nodes": 4, "bug": "429 被当成节点不通, 结果里只剩 4 个且无任何告警"},
         "worker_config_empty": {"exit": 1, "nodes": None, "max_seconds": 5,
@@ -137,6 +140,9 @@ EXPECT = {
         "worker_503_all": {"exit": 0, "nodes": 8, "status": "stale", "min_worker_requests": 25},
         "sources_down": {"exit": 0, "nodes": 8, "status": "stale"},
         "mirror_only": {"exit": 0, "nodes": ("gt", 0), "status": "fresh"},
+        # 404 属于「请求本身有问题」: 必须只发 1 次请求就放弃并切换数据源。
+        # 若有人把 4xx 塞回重试链, mirror 请求数会变成 FETCH_RETRIES(2) 次, 在这里变红。
+        "mirror_404": {"exit": 0, "nodes": 8, "status": "stale", "max_mirror_requests": 1},
         "csv_spaced_header": {"exit": 0, "nodes": ("gt", 0), "status": "fresh", "source_contains": "vpngate.net"},
         # 10 个 SSTP 节点: 4 成功 + 2 撞 429 + 4 节点不通。
         # 若 429 仍被重试 (旧行为) 请求数会是 4 + 2×3 + 4 = 14; 现在应为 10 —— 这条断言
@@ -239,9 +245,13 @@ def run_case(target, scenario, extra_env):
 
     checked_hosts = []
     worker_requests = 0
+    mirror_requests = 0
     log_path = run_dir / "fake.log"
     if log_path.exists():
         for ln in log_path.read_text(encoding="utf-8").splitlines():
+            if ln.startswith("mirror:"):
+                mirror_requests += 1
+                continue
             if not ln.startswith("worker:"):
                 continue
             worker_requests += 1
@@ -265,6 +275,7 @@ def run_case(target, scenario, extra_env):
         "status_rate_limited_ports": (status or {}).get("rate_limited_ports"),
         "status_port_detail": (status or {}).get("port_429_detail"),
         "worker_requests": worker_requests,
+        "mirror_requests": mirror_requests,
         "checked_hosts": sorted(set(checked_hosts)),
         "has_warning_annotation": "::warning::" in proc.stdout,
         "stdout_tail": proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else "",
@@ -298,6 +309,10 @@ def check(expect, result):
         problems.append(f"Worker 请求数 {result['worker_requests']} < 期望 >= {expect['min_worker_requests']} (重试未生效)")
     if expect.get("max_worker_requests") is not None and result["worker_requests"] > expect["max_worker_requests"]:
         problems.append(f"Worker 请求数 {result['worker_requests']} > 期望 <= {expect['max_worker_requests']} (429 未生效治理, 仍在滥发请求)")
+    if expect.get("max_mirror_requests") is not None and result["mirror_requests"] > expect["max_mirror_requests"]:
+        problems.append(f"镜像源请求数 {result['mirror_requests']} > 期望 <= {expect['max_mirror_requests']} (4xx 不应重试)")
+    if expect.get("min_mirror_requests") and result["mirror_requests"] < expect["min_mirror_requests"]:
+        problems.append(f"镜像源请求数 {result['mirror_requests']} < 期望 >= {expect['min_mirror_requests']} (该版本应重试 404 — 若不重试了, 说明行为变化, 请同步更新预期)")
     if expect.get("status_breakdown"):
         got = result["status_breakdown"] or {}
         for k, v in expect["status_breakdown"].items():

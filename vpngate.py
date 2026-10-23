@@ -19,6 +19,7 @@ VPN Gate SSTP 节点检测流水线
 import base64
 import csv
 import io
+import ipaddress
 import json
 import os
 import random
@@ -87,7 +88,7 @@ WORKER_CHECK_URL = (os.environ.get("CHECK_WORKER") or "").strip()
 WORKER_PLACEHOLDER = "https://你的域名/check?sstp=vpn:vpn@"
 WORKER_URL_OK = bool(re.match(r"^https?://[^\s/]+/", WORKER_CHECK_URL)) and "你的域名" not in WORKER_CHECK_URL
 CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "4")))
-CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))
+CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "60"))  # 与 README/workflow 的默认值一致(2026-10-24 前代码里是 90, 文档与 CI 一直是 60)
 CHECK_RETRIES = max(0, int(os.environ.get("CHECK_RETRIES", "2")))      # 检测服务异常时的额外重试次数
 CHECK_BACKOFF = float(os.environ.get("CHECK_BACKOFF", "2"))            # 检测重试退避基数(秒)
 CHECK_MIN_INTERVAL = float(os.environ.get("CHECK_MIN_INTERVAL", "0.25"))  # 请求最小间隔(秒), 防止打爆 Worker 上游额度
@@ -164,17 +165,20 @@ COUNTRY_ZH = {
 # 日志
 # ---------------------------------------------------------------------------
 _section = None
+_log_lock = threading.Lock()
 
 def log(section, msg=""):
+    # 加锁: check_one 在多个检测线程里并发调用, 不加锁段头与消息行会交错撕裂
     global _section
-    if section != _section:
-        print(f"========== {section} ==========", flush=True)
-        _section = section
-    if msg:
-        # 消息行带时间戳: 这样才能把 duration_s - elapsed (即 check_all 之外的所有步骤)
-        # 拆到具体阶段 —— 数据源抓取 / 下载上一版产物 / 优选 API / 入口池检测 / 写产物。
-        # 段头不加时间戳, 保持日志密度不变。不需要改任何现有调用。
-        print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+    with _log_lock:
+        if section != _section:
+            print(f"========== {section} ==========", flush=True)
+            _section = section
+        if msg:
+            # 消息行带时间戳: 这样才能把 duration_s - elapsed (即 check_all 之外的所有步骤)
+            # 拆到具体阶段 —— 数据源抓取 / 下载上一版产物 / 优选 API / 入口池检测 / 写产物。
+            # 段头不加时间戳, 保持日志密度不变。不需要改任何现有调用。
+            print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
 
 def warn(msg):
     """非致命问题: 打印告警并生成 GitHub Actions 注解 (运行页可见)。"""
@@ -189,8 +193,16 @@ def die(msg):
 # ---------------------------------------------------------------------------
 # 数据抓取
 # ---------------------------------------------------------------------------
+class _NoRetryHTTPError(RuntimeError):
+    """4xx (非 408/429): 请求本身有问题 (URL 写错 / 鉴权失败), 重试同样的请求只会得到同样的响应。"""
+
+
 def _http_get(session, url, **kwargs):
-    """带指数退避重试的 GET。网络抖动 / 5xx 会重试, 最后一次失败抛异常。"""
+    """带指数退避重试的 GET。网络抖动 / 5xx / 408 / 429 会重试, 最后一次失败抛异常。
+
+    4xx (非 408/429) 不重试, 直接抛 _NoRetryHTTPError —— 与 check_one 对 4xx 的口径
+    一致: 重试一个 404/403 不会变成 200, 只会白等退避时间、多烧一次请求。
+    """
     last_exc = None
     for attempt in range(1, FETCH_RETRIES + 1):
         try:
@@ -202,8 +214,12 @@ def _http_get(session, url, **kwargs):
             )
             if resp.status_code >= 500:
                 raise RuntimeError(f"HTTP {resp.status_code}")
+            if 400 <= resp.status_code < 500 and resp.status_code not in (408, 429):
+                raise _NoRetryHTTPError(f"HTTP {resp.status_code} (不重试)")
             resp.raise_for_status()
             return resp
+        except _NoRetryHTTPError:
+            raise
         except Exception as exc:
             last_exc = exc
             if attempt < FETCH_RETRIES:
@@ -272,6 +288,12 @@ def parse_csv(text):
     return rows
 
 def parse_mirror_json(data):
+    """镜像 JSON → 原始行。
+
+    注意 country_short 不做「全名兜底」: 若镜像只给 "country": "Japan" 而无
+    countryshort, 把全名塞进 code 会让下游 COUNTRY_ZH 映射失败、countries.code
+    变成非 2 位码。缺失就留空, 展示层自会回退到 country_long。
+    """
     servers = []
     items = data if isinstance(data, list) else [data]
     for item in items:
@@ -284,7 +306,7 @@ def parse_mirror_json(data):
         host = str(s.get("hostname") or s.get("host") or "").strip()
         ip = str(s.get("ip") or "").strip()
         if not host or not ip: continue
-        rows.append({"host": host, "ip": ip, "country_long": str(s.get("countrylong") or s.get("country_long") or s.get("country") or "").strip(), "country_short": str(s.get("countryshort") or s.get("country_short") or s.get("country") or "").strip(), "config_b64": str(s.get("openvpn_configdata_base64") or s.get("config_b64") or "").strip()})
+        rows.append({"host": host, "ip": ip, "country_long": str(s.get("countrylong") or s.get("country_long") or s.get("country") or "").strip(), "country_short": str(s.get("countryshort") or s.get("country_short") or "").strip(), "config_b64": str(s.get("openvpn_configdata_base64") or s.get("config_b64") or "").strip()})
     return rows
 
 # ---------------------------------------------------------------------------
@@ -705,7 +727,9 @@ def build_outputs(results, raw_count, sstp_count, source):
         c = n["country"] or "未知"
         countries.setdefault(c, {"code": n["country_code"] or "?", "nodes": []})["nodes"].append(n)
 
-    stats = {"raw_nodes": raw_count, "sstp_nodes": sstp_count, "checked": len(results), "success": len(available), "failed": len(results) - len(available), "countries": len(countries), "residential_est": sum(1 for n in available if n["residential"] == "residential"), "datacenter_est": sum(1 for n in available if n["residential"] == "datacenter")}
+    # checked/success 在 MERGE_LAST_GOOD=1 时含携带合并的节点, carried_over 单列出来,
+    # 「本轮实测」= checked - carried_over, 面板数字不再需要靠猜。
+    stats = {"raw_nodes": raw_count, "sstp_nodes": sstp_count, "checked": len(results), "success": len(available), "failed": len(results) - len(available), "carried_over": sum(1 for r in results if r.get("carried_over")), "countries": len(countries), "residential_est": sum(1 for n in available if n["residential"] == "residential"), "datacenter_est": sum(1 for n in available if n["residential"] == "datacenter")}
     by_country = {}
     for name, grp in countries.items():
         grp["count"] = len(grp["nodes"])
@@ -804,8 +828,23 @@ EDGE_HOST_LOCKED = {entry.split(":")[0].strip() for entry in _env_csv("EDGE_HOST
 EDGE_DNS_TIMEOUT = float(os.environ.get("EDGE_DNS_TIMEOUT", "5"))
 EDGE_TCP_TIMEOUT = float(os.environ.get("EDGE_TCP_TIMEOUT", "6"))
 
-# Cloudflare IPv4 网段
-CF_V4 = ((104, 16, 104, 31), (172, 64, 172, 127), (162, 158, 162, 159), (198, 41, 198, 41))
+# Cloudflare 官方公布网段 (https://www.cloudflare.com/ips/)
+# 旧版只记了 4 个「首两段」近似段, 误差是双向的:
+#   漏杀 —— 141.101 / 108.162 / 188.114 / 190.93 / 173.245 / 103.2x / 131.0.72 等官方段
+#           不在表里, 入口解析到这些段会被误判「非 CF 网段(疑似污染)」而剔除;
+#   误放 —— 104.28-31 / 172.72-127 / 198.41.0-127 并非 CF (实际只到 /13 与 /17);
+#   IPv6 前缀写成 2a06:4700 系笔误, 官方段是 2606:4700::/32 等 7 段。
+# 这里按官方清单精确匹配, 上游增删段时更新此表即可。
+CF_NETWORKS = tuple(ipaddress.ip_network(n) for n in (
+    # IPv4 (ips-v4)
+    "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+    "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
+    "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+    "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+    # IPv6 (ips-v6)
+    "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:b500::/32",
+    "2405:8100::/32", "2a06:98c0::/29", "2c0f:f248::/32",
+))
 
 
 def _split_host_port(entry):
@@ -820,19 +859,11 @@ def _split_host_port(entry):
 def _is_cloudflare(ip):
     if not ip:
         return False
-    if ":" in ip:  # Cloudflare IPv6 段 2a06:4700::/32
-        return ip.lower().startswith("2a06:4700")
-    parts = ip.split(".")
-    if len(parts) != 4:
-        return False
     try:
-        a, b = int(parts[0]), int(parts[1])
+        addr = ipaddress.ip_address(str(ip).strip())
     except ValueError:
         return False
-    for sa, sb, ea, eb in CF_V4:
-        if a == sa and sb <= b <= eb:
-            return True
-    return False
+    return any(addr in net for net in CF_NETWORKS)
 
 
 def _dns_build_query(domain):
@@ -900,9 +931,10 @@ def _tcp_ok(host, port=443, timeout=EDGE_TCP_TIMEOUT):
         return False
 
 
-# 优选 API 返回的入口既可能是裸 IP 也可能是域名, 两种都要认
+# 优选 API 返回的入口既可能是裸 IP 也可能是域名, 两种都要认。
+# 域名必须含至少一个点: 单标签词 (如 "abc") 不是合法公网域名, 采信只会浪费一次 DNS 检测
 _IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
-_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)*$")
+_HOSTNAME_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+$")
 
 
 def _is_ip_literal(host):
@@ -941,6 +973,44 @@ def _dedupe_entries(entries):
             seen.add(entry)
             out.append(entry)
     return out
+
+
+def _looks_ipv6(entry):
+    """条目是不是合法 IPv6 字面量 (允许带方括号; 裸 IPv6 也认)。"""
+    h = entry.strip()
+    if h.startswith("[") and h.endswith("]"):
+        h = h[1:-1]
+    try:
+        return ipaddress.ip_address(h).version == 6
+    except ValueError:
+        return False
+
+
+def _drop_unsupported_entries(entries):
+    """入口条目前置清理: 去重 + 剔除 IPv6 字面量与含冒号的脏条目。返回清理后的列表。
+
+    - 去重: 用户在 EDGE_HOSTS 环境变量里混入重复条目时, idx % len(edge) 的轮换会向
+      重复项倾斜、部分入口被过度使用。
+    - 剔除: 节点行格式 (NODE_LINE_RE / validate_nodes_text) 只认「域名或 IPv4:端口」。
+      IPv6 条目留下来要么被 DNS 检测误杀 (报「无 A 记录」), 要么在 EDGE_DNS_CHECK=0 /
+      HOSTS_ENTRY 显式路径下流进产物、让发布前自检整轮拒发 —— 都不如明说并剔除。
+      真要支持 IPv6 需同时改节点行格式与 edgetunnel 侧的解析, 属独立的大改动。
+      告警分两类: 「IPv6 条目」与「含冒号但不是 IPv6 的脏条目」(如 foo:bar:baz),
+      避免把排查方向带偏 —— 两者都剔除, 但原因不同。
+    filter_edge_hosts (自动路径) 与 HOSTS_ENTRY (人工路径) 共用这道清理;
+    人工路径的黑名单/DNS 检测仍然跳过, 「人工指定优先」的语义不变。
+    """
+    entries = _dedupe_entries(entries)
+    dropped = [e for e in entries if ":" in _split_host_port(e)[0]]
+    if dropped:
+        v6 = [e for e in dropped if _looks_ipv6(e) or _looks_ipv6(_split_host_port(e)[0])]
+        junk = [e for e in dropped if e not in v6]
+        if v6:
+            warn(f"入口池含 IPv6 条目, 当前节点行格式仅支持域名/IPv4, 已剔除 {len(v6)} 个: {', '.join(v6[:5])}")
+        if junk:
+            warn(f"入口池含无法解析为「域名/IPv4:端口」的脏条目 (含冒号但不是 IPv6), 已剔除 {len(junk)} 个: {', '.join(junk[:5])}")
+        return [e for e in entries if ":" not in _split_host_port(e)[0]]
+    return entries
 
 
 def fetch_optimal_hosts(session, limit=None):
@@ -988,6 +1058,14 @@ def filter_edge_hosts(entries):
     """剔除黑名单域名, 以及被 DNS 污染或 TCP 不通的入口域名。全部不可用时保留原列表。"""
     if not entries:
         return entries
+
+    # 第 0 步 (不受 EDGE_DNS_CHECK=0 影响): 去重 + 剔除不支持的 IPv6 字面量。
+    # 必须放在 DNS 检测早返回之前 —— 否则 EDGE_DNS_CHECK=0 时 IPv6 会流进产物、
+    # 让发布前自检整轮拒发。细节见 _drop_unsupported_entries。
+    entries = _drop_unsupported_entries(entries)
+    if not entries:
+        log("EDGE DNS", "警告: 清理后入口列表为空")
+        return []
 
     # 第 1 步: 黑名单直接剔除 (无需检测)
     if EDGE_HOST_BLACKLIST:
@@ -1091,7 +1169,10 @@ def build_nodes_text(data, edge_hosts=None, optimal_hosts=None):
         edge = list(edge_hosts)
     else:
         _entry = os.environ.get("HOSTS_ENTRY", "").strip()
-        base = [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS
+        # 显式路径只做「去重 + IPv6 剔除」这层无害清理 (IPv6 过不了发布前自检, 留着会让
+        # 整轮拒发); 黑名单/DNS 检测仍仅在未显式指定时进行, 人工指定优先的语义不变。
+        base = (_drop_unsupported_entries([e.strip() for e in _entry.split(",") if e.strip()])
+                if _entry else list(EDGE_HOSTS))
         # DNS 污染过滤 (仅在未显式指定 HOSTS_ENTRY 时生效, 保证人工指定优先)
         if not _entry:
             # 自动优选 IP 必须排池首: 下面按 edge[idx % len(edge)] 顺序轮换, 而静态池有上百条、
@@ -1100,10 +1181,16 @@ def build_nodes_text(data, edge_hosts=None, optimal_hosts=None):
                 log("EDGE", f"自动优选 {len(optimal_hosts)} 个 IP 置于入口池首, 静态域名降为兜底")
                 base = _dedupe_entries(list(optimal_hosts) + base)
             base = filter_edge_hosts(base)
-        # 兜底: 极端情况下 (如黑名单清空列表) 回退到原始 EDGE_HOSTS, 避免除零/空轮换
+        # 兜底: 极端情况下 (如黑名单清空列表) 回退到原始 EDGE_HOSTS, 避免除零/空轮换。
+        # 回退也必须过清理 —— 否则全 IPv6 的 EDGE_HOSTS 会在这里绕回产物, 让发布前
+        # 自检整轮拒发; 清理后仍为空则直接返回空串, 让 main 降级为「入口池配置异常」,
+        # 而不是误导性的「节点行格式自检未通过」。
         if not base:
             log("EDGE DNS", "警告: 筛选结果为空, 回退到完整入口列表")
-            base = list(EDGE_HOSTS)
+            base = _drop_unsupported_entries(list(EDGE_HOSTS))
+            if not base:
+                log("EDGE DNS", "警告: 回退后入口列表仍为空, 无法生成节点行 (入口池配置全是不支持的格式)")
+                return ""
         edge = base
     if not edge:
         log("EDGE DNS", "警告: 入口池为空, 无法生成任何节点行")

@@ -121,6 +121,8 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 1. **改常量**（推荐）：打开 `vpngate.py`，把 `_DEFAULT_EDGE_HOSTS` 里的域名列表换成你测出来的（逗号分隔，格式 `域名:443`），提交推送，等下一次自动运行或手动触发 Action。
 2. **用环境变量覆盖**（不动代码）：在 `.github/workflows/check.yml` 主步骤的 `env:` 里加一行 `EDGE_HOSTS: "a.com:443,b.com:443"`。
 
+> **入口条目格式**：仅支持「域名」或「IPv4:端口」（端口可省，默认 443）。**IPv6 字面量（如 `[2606:4700::1]:443`）暂不支持** —— 节点行格式与 edgetunnel 解析侧都只认域名/IPv4；混入 IPv6 条目会被脚本剔除并告警，不会中断发布。重复条目会被自动去重，不影响轮换分布。
+
 ### 本地测速工具（BestCF）
 本地测优选域名推荐用 BestCF 在线工具：`https://bestcf.fxxk.dedyn.io/`（纯前端，打开即用）。
 
@@ -274,7 +276,7 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 6. **发布前产物自检**：`validate_nodes_text()` 逐行校验 `nodes.txt`（入口与节点主机必须是域名），格式不合格就**拒绝发布**并降级沿用上一版 —— 防止「运行绿色但订阅是坏的」（2026-10-07 踩过这个坑：入口池被按字符拆开，每行入口变成单个字母，而当时测试只数行数）。
 7. **入口池解析**：`_env_csv()` 统一读取「逗号分隔」配置，**返回条目列表**，调用方不需要（也无法忘记）`.split(",")`。
 
-> 想本地验证这些行为（无需联网）：`python tests/run_tests.py`（16 组故障场景）。
+> 想本地验证这些行为（无需联网）：`python tests/run_tests.py`（17 组故障场景）。
 > 沙箱环境若因批量删除被拦，换一个空的运行目录即可：`TEST_RUNS_DIR=tests/runs_v2 python tests/run_tests.py`。
 
 ---
@@ -350,6 +352,11 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 > 旧版把 429 当成「检测服务异常」重试 2 次（退避仅 2~5 秒），对持续限流毫无作用，
 > 反而把请求量放大 3 倍、加剧限流 —— 这是「抓不到新节点」的真正原因。
 
+### 运行时间逼近 45 分钟超时怎么办
+443 长期限流时，全局自适应退避会反复暂停所有检测线程（特征：`status.json` 的 `rate_limited_ports` 长期含 443、日志多次出现「全局自适应退避触发」）。两个旋钮可缓解：
+- 设 `CHECK_BUDGET`（如 `60`）限制单轮检测量；
+- 调低 `PORT_CB_THRESHOLD`（如 `2`）让端口熔断更早生效，把额度让给其它端口。
+
 ### 检测 Worker 报错 / 大面积成功率为 0
 浏览器直接打开 `https://你的Worker/check?sstp=vpn:vpn@任意节点:端口` 看返回的 JSON：
 - `"error": "... 429 Too Many Requests"` → Worker 上游限速，降低 `CHECK_CONCURRENCY` 或换用自带额度的查询接口。
@@ -368,7 +375,10 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 
 | 日期 | 版本 | 变更 |
 | :--- | :--- | :--- |
-| 2026-10-21 | v1.6.2 | **`port_429_detail` 记录范围扩展**：从「只记被熔断的端口」改为「所有出现 429 的端口 ∪ 熔断端口」，并同步更名（原名 `rate_limited_ports_detail` 是 `rate_limited_ports` 的附属，扩展后会含不在其中的端口，保留原名会误导）。原因：只记熔断端口会形成**反向激励** —— 越是「阈值可能设错了」的情况（限流缓解到没触发熔断）越拿不到 `candidates_in_source`，阈值就永远判不了。现在 `skipped=0` 表示「有 429 但未熔断」；`candidates` 与 `probed_429 + skipped` 的守恒只对已熔断端口成立。测试新增 `port_detail_nonempty` 守卫（`rl_breakdown` 场景：9 个端口各撞一次 429、不熔断，仍须进 detail）。README 补 `PREFER_NEW_NODES` 的固有副作用（新节点超时概率更高，单节点成本约 1.8 倍，设 budget 不一定更快）与「没测 ≠ 不可用」说明 |（写成「老节点优先」，与语义相反；`CHECK_BUDGET=0` 时不触发截断分支故一直未暴露）；`status.json` 增加 `target_ratelimit_probed` 与 `port_429_detail`，以区分「限流 14」中的包含关系；`port_429_detail` 采用 list-of-dict（`port` 为 int，避免 JSON key 字符串化）；测试新增 `budget_new_first` 场景 |
+| 2026-10-24 | v1.6.4 | **复查完善**：`_http_get` 对 4xx（非 408/429）不再重试（URL 写错/鉴权失败重试无意义，与 `check_one` 口径一致）；`filter_edge_hosts` 新增第 0 步——入口去重 + IPv6 字面量明确剔除并告警（此前 IPv6 条目会被 DNS 检测误报「无 A 记录」，`EDGE_DNS_CHECK=0` 时更会流进产物导致发布前自检整轮拒发；节点行格式仅支持域名/IPv4，README 已声明）；`parse_mirror_json` 的 `country_short` 不再用国家全名兜底（避免 `countries.code` 出现 "Japan" 类非 2 位码，展示层回退 `country_long`）；`data.json` stats 新增 `carried_over`（MERGE 模式下区分「本轮实测」与「携带合并」）；workflow 开启 Pages 步骤增加返回码检查，失败时打明确告警并指引手动开启，查询返回 403 时同样告警（注：GITHUB_TOKEN 无 `administration` 权限键可用，该建议不可行）；`Show site URL` 改为按仓库动态拼接（fork/改名后自动正确）；`HOSTS_ENTRY` 显式路径共用同一道「去重+IPv6 剔除」清理（`_drop_unsupported_entries`），人工指定仍优先于黑名单/DNS 检测，`build_nodes_text` 的回退分支同样过清理（入口池全为不支持的格式时准确降级为「入口池配置异常」，而非误导性的「节点行格式自检未通过」），清理告警按「IPv6 条目 / 含冒号脏条目」分类；测试新增 `mirror_404` 场景与 `filter_edge_hosts` 单元断言 |
+| 2026-10-24 | v1.6.3 | **检查与完善**：`_is_cloudflare` 改用 Cloudflare 官方公布网段（ips-v4/ips-v6）精确匹配 —— 旧版 4 个「首两段」近似段漏掉 `141.101` / `108.162` / `188.114` / `190.93` / `173.245` / `103.2x` / `131.0.72` 等官方段，入口解析到这些段会被误判「疑似污染」而剔除；同时 `104.28-31` / `172.72-127` / `198.41.0-127` 放得过宽（CF 实际只到 /13 与 /17）；IPv6 前缀 `2a06:4700` 系笔误（官方段是 `2606:4700::/32` 等 7 段）。workflow「首次运行自动开启 Pages」改用 POST 创建站点（PUT 只能更新已存在的站点，对未开启 Pages 的仓库恒 404，该步骤此前从不生效），且不再携带与 `build_type=workflow` 矛盾的 `source` 参数；`CHECK_TIMEOUT` 代码默认值 90→60 与文档/CI 对齐；`log()` 加锁防并发日志交错；优选 API 行的主机名必须含点（拒绝 `abc` 这类单标签脏数据）；还原 v1.6.1 变更记录（此前表格串行损坏）；测试新增 `_is_cloudflare` 网段与 `_normalize_optimal_line` 解析的单元断言 |
+| 2026-10-21 | v1.6.2 | **`port_429_detail` 记录范围扩展**：从「只记被熔断的端口」改为「所有出现 429 的端口 ∪ 熔断端口」，并同步更名（原名 `rate_limited_ports_detail` 是 `rate_limited_ports` 的附属，扩展后会含不在其中的端口，保留原名会误导）。原因：只记熔断端口会形成**反向激励** —— 越是「阈值可能设错了」的情况（限流缓解到没触发熔断）越拿不到 `candidates_in_source`，阈值就永远判不了。现在 `skipped=0` 表示「有 429 但未熔断」；`candidates` 与 `probed_429 + skipped` 的守恒只对已熔断端口成立。测试新增 `port_detail_nonempty` 守卫（`rl_breakdown` 场景：9 个端口各撞一次 429、不熔断，仍须进 detail）。README 补 `PREFER_NEW_NODES` 的固有副作用（新节点超时概率更高，单节点成本约 1.8 倍，设 budget 不一定更快）与「没测 ≠ 不可用」说明 |
+| 2026-10-21 | v1.6.1 | **修复 `PREFER_NEW_NODES` 排序方向写反**（写成「老节点优先」，与语义相反；`CHECK_BUDGET=0` 时不触发截断分支故一直未暴露）；`status.json` 增加 `target_ratelimit_probed` 与 `port_429_detail`，以区分「限流 14」中的包含关系；`port_429_detail` 采用 list-of-dict（`port` 为 int，避免 JSON key 字符串化）；测试新增 `budget_new_first` 场景 |
 | 2026-10-21 | v1.6.0 | **修复「抓不到新节点」**：失败三级归因（`target_ratelimit`/`worker_error`/`node_dead`），429 默认不重试；新增按端口自适应熔断（`PORT_CB_THRESHOLD`）+ 全局滑窗退避（`GLOBAL_RL_*`）；新增检测预算 `CHECK_BUDGET` 与「新节点/住宅型优先」（`PREFER_NEW_NODES`）；`status.json` 增加 `failure_breakdown`/`rate_limited_ports`/`new_nodes`；修复降级分支不写 `status.json` 的 bug（`failed` 时产物缺失导致误判「脚本没跑」）；测试新增 `port_cb`、`rl_breakdown`、`worker_http403` 三场景 |
 | 2026-10-12 | v1.5.1 | **配置修正**：本地实测 125 个静态优选域名（TCP 443 + `/cdn-cgi/trace` 双检），剔除 DNS 失效的 `cmcc.cc.cd:443`，入口池 125 → 124 个 |
 | 2026-10-12 | v1.5.0 | **行为变更（minor）**：新增 `OPTIMAL_API` 内置自动优选 —— 每轮运行从优选接口现取优选 IP 置于入口池首，支持 `off`/`0`/`none`/`false` 关闭；`filter_edge_hosts` 新增裸 IP 分支（只做 TCP 检测，不参与 DNS 污染判定）；`data.json` 新增 `optimal_api` 字段；`tests/run_tests.py` 回归环境设 `OPTIMAL_API=off` 保证离线可复现 |

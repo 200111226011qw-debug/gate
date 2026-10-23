@@ -84,7 +84,9 @@ jobs:
             "https://raw.githubusercontent.com/lsh8848/cm-Workers-CheckSocks5/refs/heads/main/_worker.js"; then
             echo "检测 Worker 脚本已同步: $(wc -c < public/check-worker.js) bytes"
           else
-            echo "警告: 检测 Worker 脚本同步失败 (不影响本轮节点生成, 保留旧副本)"
+            # runner 是全新目录且 public/ 不入库, 同步失败时本轮产物里就是没有 check-worker.js,
+            # 不存在「旧副本」可沿用 —— 检查 Worker 已部署的实例不受影响, 只影响网页取最新脚本的入口
+            echo "警告: 检测 Worker 脚本同步失败, 本轮产物不含 check-worker.js (不影响 nodes.txt 生成)"
           fi
 
       - name: Ensure GitHub Pages is enabled (one-time auto setup)
@@ -94,14 +96,28 @@ jobs:
             "https://api.github.com/repos/$GITHUB_REPOSITORY/pages")
           echo "Pages API status: $code"
           if [ "$code" = "404" ]; then
-            echo "首次运行: 启用 GitHub Pages (source = GitHub Actions, 目录 /public)"
-            curl -sS -X PUT \
+            echo "首次运行: 启用 GitHub Pages (build_type = workflow)"
+            # 创建 Pages 站点必须用 POST —— PUT 只能「更新已存在的站点」, 对未开启 Pages 的
+            # 仓库同样返回 404, 旧写法导致本步骤从未真正开启过 Pages (2026-10-24 修)。
+            # build_type=workflow 时不需要也不能带 source (branch/path 是 legacy 模式的参数)。
+            # 注意: GITHUB_TOKEN 没有 administration 权限可用 (workflow permissions 不支持该键),
+            # 若仓库设置不允许 token 开启 Pages, 下面会拿到 4xx —— 打明确告警引导手动开启, 不静默。
+            http=$(curl -sS -o "$RUNNER_TEMP/pages-create.json" -w '%{http_code}' -X POST \
               -H "Authorization: Bearer $GITHUB_TOKEN" \
               -H "Content-Type: application/json" \
-              -d '{"build_type":"workflow","source":{"branch":"main","path":"/public"}}' \
-              "https://api.github.com/repos/$GITHUB_REPOSITORY/pages"
+              -d '{"build_type":"workflow"}' \
+              "https://api.github.com/repos/$GITHUB_REPOSITORY/pages")
+            if [ "$http" = "201" ] || [ "$http" = "204" ]; then
+              echo "Pages 已开启 (HTTP $http)"
+            else
+              echo "::warning::自动开启 Pages 失败 (HTTP $http): $(cat "$RUNNER_TEMP/pages-create.json") — 请到仓库 Settings → Pages 手动将 Source 设为 GitHub Actions"
+            fi
             echo
             sleep 10
+          elif [ "$code" = "403" ]; then
+            # 防御性分支: token 连「查询 Pages 状态」都不允许时, 至少把这件事说出来,
+            # 不让「跳过创建」被误读成「Pages 已就绪」。
+            echo "::warning::查询 Pages 状态返回 403 (token 无权限) — 无法自动确认/开启 Pages, 请手动到 Settings → Pages 检查 Source 是否为 GitHub Actions"
           fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -123,4 +139,6 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Show site URL
-        run: 'echo "site: https://200111226011qw-debug.github.io/gate/ (deploy outcome: ${{ steps.deployment.outcome }})"'
+        # 按仓库动态拼接 (fork / 改名后自动正确): owner 取 GITHUB_REPOSITORY_OWNER,
+        # 仓库名从 GITHUB_REPOSITORY (形如 owner/repo) 里剥掉 owner/ 前缀。
+        run: 'echo "site: https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/ (deploy outcome: ${{ steps.deployment.outcome }})"'

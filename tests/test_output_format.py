@@ -184,6 +184,56 @@ def check_version(path, should_pass):
             except Exception as exc:
                 problems.append(f"parse_csv 无法解析{label2}: {type(exc).__name__}: {exc}")
 
+    # 8) Cloudflare 网段判定 (filter_edge_hosts「疑似污染」信号的依据, 错了会误杀/漏杀入口)
+    #    覆盖官方 ips-v4 的每个段至少一个地址 + 边界外必须判 False。
+    #    背景: 旧实现按「首两段」近似, 漏掉 141.101/108.162/188.114/190.93/173.245/
+    #    103.2x/131.0.72 等官方段 (入口被误判污染而剔除), 又把 104.28-31/172.72-127/
+    #    198.41.0-127 误认为 CF; IPv6 前缀还写成了 2a06:4700 (应为 2606:4700)。
+    if should_pass and hasattr(mod, "_is_cloudflare"):
+        must_hit = [
+            "173.245.48.1", "103.21.244.1", "103.22.200.1", "103.31.4.1",
+            "141.101.64.1", "108.162.192.1", "190.93.240.1", "188.114.96.1",
+            "197.234.240.1", "198.41.128.1", "162.158.0.1", "162.159.255.255",
+            "104.16.0.1", "104.23.255.255", "104.24.0.1", "104.27.255.255",
+            "172.64.0.1", "172.71.255.255", "131.0.72.1",
+            "2606:4700::6810:85e5", "2400:cb00::1",
+        ]
+        must_miss = [
+            "8.8.8.8", "104.28.0.1", "172.72.0.1", "198.41.127.1",
+            "203.0.113.1", "2a06:4700::1", "2001:db8::1",
+        ]
+        wrong = [ip for ip in must_hit if not mod._is_cloudflare(ip)]
+        wrong += [ip for ip in must_miss if mod._is_cloudflare(ip)]
+        if wrong:
+            problems.append(f"_is_cloudflare 判定与官方网段不符 (应判 {wrong[:4]}…共 {len(wrong)} 个)")
+
+    # 9) 优选 API 行解析: 裸 IP/域名自动补 :443; 单标签词与脏数据必须拒绝
+    if should_pass and hasattr(mod, "_normalize_optimal_line"):
+        accept_cases = [
+            ("104.18.33.230#CF 电信优选", "104.18.33.230:443"),
+            ("example.com", "example.com:443"),
+            ("1.2.3.4:8443#名字", "1.2.3.4:8443"),
+            ("https://5.6.7.8/path?x=1", "5.6.7.8:443"),
+        ]
+        for raw_line, want in accept_cases:
+            got = mod._normalize_optimal_line(raw_line)
+            if got != want:
+                problems.append(f"_normalize_optimal_line({raw_line!r})={got!r} != {want!r}")
+        for junk in ("single", "", "::1", "a b:443"):
+            got = mod._normalize_optimal_line(junk)
+            if got is not None:
+                problems.append(f"_normalize_optimal_line({junk!r}) 应拒绝, 实际返回 {got!r}")
+
+    # 10) 入口池过滤第 0 步: 去重 + IPv6/脏条目剔除 (EDGE_DNS_CHECK=0 时也必须生效,
+    #     否则这些条目会流进产物、让发布前自检整轮拒发)
+    if should_pass and hasattr(mod, "filter_edge_hosts"):
+        got = mod.filter_edge_hosts(["a.example:443", "a.example:443", "[2606:4700::1]:443", "b.example:443"])
+        if got != ["a.example:443", "b.example:443"]:
+            problems.append(f"filter_edge_hosts 去重/IPv6 剔除不符合预期: {got!r}")
+        # 全部条目不合法时必须返回空 (而不是回退原列表), 让上游降级原因指向「入口池配置异常」
+        if mod.filter_edge_hosts(["[2606:4700::1]:443", "2606:4700::1", "foo:bar:baz"]) != []:
+            problems.append("filter_edge_hosts 对全 IPv6/脏条目列表应返回空列表")
+
     return problems
 
 
