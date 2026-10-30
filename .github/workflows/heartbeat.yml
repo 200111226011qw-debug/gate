@@ -1,0 +1,130 @@
+name: Gate Heartbeat
+
+# 发布后复检: check.yml 每 12 小时才产出一版, 而 VPN Gate 的 SSTP 节点常在几十分钟内成批失效。
+# 这个 workflow 每小时把**线上已发布**的 nodes.txt 拿回来抽查, 把连续多轮确认不通的节点摘掉并重发,
+# 把"订阅变差"的窗口从 12 小时压到 1 小时。
+#
+# 与 check.yml 的关系:
+#   * 共用 concurrency group (gate-check) —— 两个 workflow 都会部署同一个 Pages 站点,
+#     并行部署会互相覆盖, 必须串行。
+#   * 复用同一份检测逻辑 (heartbeat.py 直接 import vpngate.py 的 check_one),
+#     因此归因口径 / 熔断 / 限速与主流程完全一致, 不存在两套判定。
+
+on:
+  schedule:
+    - cron: "23 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: gate-check
+  cancel-in-progress: false
+
+jobs:
+  heartbeat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -V
+          python -m pip --disable-pip-version-check install -r requirements.txt
+          python -c "import requests, sys; print('依赖自检通过: requests', requests.__version__, '| python', sys.version.split()[0])"
+
+      - name: 复检线上节点并摘除确认失效的节点
+        id: hb
+        env:
+          CHECK_WORKER: ${{ secrets.DOMAIN }}
+          # 心跳是在已发布产物上做增量探测, 请求量必须比主流程更保守:
+          # 它每小时跑一次, 额度放大 24 倍, 并发再拉高就等于主动触发 429。
+          CHECK_MIN_INTERVAL: "0.5"
+          HEARTBEAT_BUDGET: "12"
+          HEARTBEAT_CONCURRENCY: "2"
+          HEARTBEAT_TIMEOUT: "30"
+          HEARTBEAT_CONFIRM: "2"
+          HEARTBEAT_MIN_ALIVE: "5"
+          HEARTBEAT_MAX_DEAD_RATIO: "0.5"
+        run: |
+          set +e
+          python heartbeat.py
+          code=$?
+          set -e
+          echo "heartbeat exit code: $code"
+          if [ "$code" = "1" ]; then
+            echo "::error::心跳未能读取线上产物, 跳过部署 (线上保持原样)"
+            exit 1
+          fi
+          if [ "$code" = "3" ]; then
+            echo "::warning::样本确认不通比例过高 — 交下一步完整重跑, 本轮不做部分摘除"
+          fi
+
+      # 只在"大面积失效"时升级: 部分摘除治不了病根, 需要重新抓源 + 重新检测。
+      # 这一步故意不 fail-fast —— 完整重跑失败时, 部署上一步摘好的心跳产物仍比不部署好。
+      - name: 升级为完整重跑
+        if: steps.hb.outputs.escalate == 'true'
+        run: |
+          python vpngate.py || echo "::warning::完整重跑未成功 (可能降级), 将继续部署心跳产物"
+        env:
+          CHECK_WORKER: ${{ secrets.DOMAIN }}
+          CHECK_CONCURRENCY: "4"
+          CHECK_TIMEOUT: "60"
+          CHECK_RETRIES: "2"
+          CHECK_BACKOFF: "2"
+          CHECK_MIN_INTERVAL: "0.25"
+          FETCH_RETRIES: "3"
+          FETCH_BACKOFF: "3"
+          MIN_SUCCESS: "5"
+
+      - name: 运行结果汇总
+        if: always()
+        run: |
+          echo "job status: ${{ job.status }}"
+          for f in public/heartbeat.json public/status.json; do
+            if [ -f "$f" ]; then
+              echo "---------- $f ----------"
+              cat "$f"
+            else
+              echo "$f 不存在"
+            fi
+          done
+          if [ -f public/nodes.txt ]; then
+            echo "---------- public/nodes.txt 前 3 行 (共 $(wc -l < public/nodes.txt) 行) ----------"
+            head -n 3 public/nodes.txt
+          fi
+
+      - name: Configure Pages
+        if: steps.hb.outputs.deploy == 'true'
+        uses: actions/configure-pages@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload Pages artifact
+        if: steps.hb.outputs.deploy == 'true'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: 'public'
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        if: steps.hb.outputs.deploy == 'true'
+        uses: actions/deploy-pages@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Show site URL
+        if: steps.hb.outputs.deploy == 'true'
+        run: 'echo "site: https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/ (deploy outcome: ${{ steps.deployment.outcome }})"'

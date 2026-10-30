@@ -196,6 +196,52 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 
 ---
 
+## 发布后心跳（heartbeat.py / heartbeat.yml）
+
+`check.yml` 每 12 小时才产出一版，而 VPN Gate 的 SSTP 节点常在几十分钟内成批失效。
+`vpngate.py` 的 stale 保护在**发布层** —— 它保证「这一轮产不出东西时别把订阅改差」，
+但管不了「发布成功之后、下一轮之前节点死掉」。这段空窗里订阅照发，客户端拿到的是死节点，
+而 gate 要等 12 小时才知道。
+
+`heartbeat.yml` 每小时把**线上已发布**的 `nodes.txt` 拿回来抽查，把连续多轮确认不通的节点摘掉并重发，
+把「订阅变差」的窗口从 12 小时压到 1 小时。
+
+三条不可退让的约束（破坏性操作必须有约束，否则它比问题本身更危险）：
+
+1. **只摘「确认节点侧不通」的。** `target_ratelimit`（限流未测）与 `worker_error`（检测服务异常）
+   一律保留 —— 它们代表「没测成」而不是「测出来不通」。把未测当不通，会在 Worker 抽风的那一小时里
+   把整个订阅洗掉。
+2. **同一节点连续 `HEARTBEAT_CONFIRM` 轮确认才摘。** 证据跨轮累积在 `heartbeat.json`；
+   单轮结论可能是误判（路由抖动、证书问题）。
+3. **摘后不足 `HEARTBEAT_MIN_ALIVE`，或单轮确认不通占比超过 `HEARTBEAT_MAX_DEAD_RATIO` → 不摘**，
+   改用退出码 `3` 让 workflow 跑一次完整重跑。大面积失效要重新抓源，不是就地砍订阅。
+
+| 名称 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `HEARTBEAT_BUDGET` | `12` | 单轮最多复检多少个节点。它每小时跑一次，额度放大 24 倍，别按主流程的规模设 |
+| `HEARTBEAT_CONCURRENCY` | `2` | 并发，必须低于主流程 |
+| `HEARTBEAT_TIMEOUT` | `30` | 单次复检超时（秒），压过 10 分钟会与下一轮重叠 |
+| `HEARTBEAT_CONFIRM` | `2` | 连续 N 轮确认才摘除 |
+| `HEARTBEAT_MIN_ALIVE` | `MIN_SUCCESS` | 摘除后剩余下限，低于此值不动手 |
+| `HEARTBEAT_MAX_DEAD_RATIO` | `0.5` | 单轮确认不通占比超过该值 → 升级为完整重跑 |
+
+另外两点值得知道：
+
+- **部署是整站替换。** `upload-pages-artifact` 上传什么，站点上就只剩什么。所以心跳会先把线上
+  `index.html` / `status.json` / `check-worker.js` / `endpoints.json` / `data.json` 镜像到 `public/`，
+  再改其中需要改的文件 —— 否则「只写 nodes.txt 就部署」会把其他产物从线上删掉。
+- **不碰 `status.json`。** 那份文件是「那一轮生成」的结论；心跳改写它会让面板数字与 `data.json` 对不上。
+  心跳自己的结论写在 `heartbeat.json`（含 `outcome` / 本轮口径 / 死链证据 / 采样游标）。
+- 采样带游标轮转，N 轮内可覆盖全表；不想用就删掉 `heartbeat.yml`，或在 Actions 里 disable 该 workflow。
+
+离线测试（30 个用例，覆盖「该摘 / 不该摘」的各类边界与落盘结果）：
+
+```bash
+PYTHONPATH=tests python -m unittest discover -s tests -p "test_heartbeat*.py" -v
+```
+
+---
+
 ## 六、自动更新的健壮性设计（为什么不会再「整轮挂掉」）
 
 每次运行都会在 `public/status.json`（同时发布到 Pages）写下结论：
@@ -375,6 +421,7 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 
 | 日期 | 版本 | 变更 |
 | :--- | :--- | :--- |
+| 2026-10-30 | v1.7.0 | **新增发布后心跳**（`heartbeat.py` + `heartbeat.yml`）：每小时复检线上 `nodes.txt`，把连续 `HEARTBEAT_CONFIRM` 轮确认不通的节点摘掉并重发，把「发布后 12 小时空窗」压到 1 小时。三条硬约束：只摘 `failure_kind=node_dead`（`target_ratelimit`/`worker_error` 一律保留，未测不等于不通）、证据跨轮累积且当轮必须仍是 `node_dead`（旧证据不能支撑摘除动作）、摘后低于 `HEARTBEAT_MIN_ALIVE` 或单轮死亡占比超 `HEARTBEAT_MAX_DEAD_RATIO` 则改用退出码 3 触发完整重跑。复用 `vpngate.check_one`/`PortCircuitBreaker`/`AdaptiveLimiter`，归因与熔断口径零分叉；部署前先镜像线上整站产物（Pages 部署是整站替换，漏镜像会把 `index.html`/`check-worker.js` 从线上删掉）；`data.json` 同步裁剪且 `raw_nodes`/`checked` 等「那一轮」字段保持原值，心跳结论独立写 `heartbeat.json`，不改 `status.json`。新增 30 个离线用例（`test_heartbeat.py` 判定边界 + `test_heartbeat_flow.py` 全流程落盘） |
 | 2026-10-24 | v1.6.4 | **复查完善**：`_http_get` 对 4xx（非 408/429）不再重试（URL 写错/鉴权失败重试无意义，与 `check_one` 口径一致）；`filter_edge_hosts` 新增第 0 步——入口去重 + IPv6 字面量明确剔除并告警（此前 IPv6 条目会被 DNS 检测误报「无 A 记录」，`EDGE_DNS_CHECK=0` 时更会流进产物导致发布前自检整轮拒发；节点行格式仅支持域名/IPv4，README 已声明）；`parse_mirror_json` 的 `country_short` 不再用国家全名兜底（避免 `countries.code` 出现 "Japan" 类非 2 位码，展示层回退 `country_long`）；`data.json` stats 新增 `carried_over`（MERGE 模式下区分「本轮实测」与「携带合并」）；workflow 开启 Pages 步骤增加返回码检查，失败时打明确告警并指引手动开启，查询返回 403 时同样告警（注：GITHUB_TOKEN 无 `administration` 权限键可用，该建议不可行）；`Show site URL` 改为按仓库动态拼接（fork/改名后自动正确）；`HOSTS_ENTRY` 显式路径共用同一道「去重+IPv6 剔除」清理（`_drop_unsupported_entries`），人工指定仍优先于黑名单/DNS 检测，`build_nodes_text` 的回退分支同样过清理（入口池全为不支持的格式时准确降级为「入口池配置异常」，而非误导性的「节点行格式自检未通过」），清理告警按「IPv6 条目 / 含冒号脏条目」分类；测试新增 `mirror_404` 场景与 `filter_edge_hosts` 单元断言 |
 | 2026-10-24 | v1.6.3 | **检查与完善**：`_is_cloudflare` 改用 Cloudflare 官方公布网段（ips-v4/ips-v6）精确匹配 —— 旧版 4 个「首两段」近似段漏掉 `141.101` / `108.162` / `188.114` / `190.93` / `173.245` / `103.2x` / `131.0.72` 等官方段，入口解析到这些段会被误判「疑似污染」而剔除；同时 `104.28-31` / `172.72-127` / `198.41.0-127` 放得过宽（CF 实际只到 /13 与 /17）；IPv6 前缀 `2a06:4700` 系笔误（官方段是 `2606:4700::/32` 等 7 段）。workflow「首次运行自动开启 Pages」改用 POST 创建站点（PUT 只能更新已存在的站点，对未开启 Pages 的仓库恒 404，该步骤此前从不生效），且不再携带与 `build_type=workflow` 矛盾的 `source` 参数；`CHECK_TIMEOUT` 代码默认值 90→60 与文档/CI 对齐；`log()` 加锁防并发日志交错；优选 API 行的主机名必须含点（拒绝 `abc` 这类单标签脏数据）；还原 v1.6.1 变更记录（此前表格串行损坏）；测试新增 `_is_cloudflare` 网段与 `_normalize_optimal_line` 解析的单元断言 |
 | 2026-10-21 | v1.6.2 | **`port_429_detail` 记录范围扩展**：从「只记被熔断的端口」改为「所有出现 429 的端口 ∪ 熔断端口」，并同步更名（原名 `rate_limited_ports_detail` 是 `rate_limited_ports` 的附属，扩展后会含不在其中的端口，保留原名会误导）。原因：只记熔断端口会形成**反向激励** —— 越是「阈值可能设错了」的情况（限流缓解到没触发熔断）越拿不到 `candidates_in_source`，阈值就永远判不了。现在 `skipped=0` 表示「有 429 但未熔断」；`candidates` 与 `probed_429 + skipped` 的守恒只对已熔断端口成立。测试新增 `port_detail_nonempty` 守卫（`rl_breakdown` 场景：9 个端口各撞一次 429、不熔断，仍须进 detail）。README 补 `PREFER_NEW_NODES` 的固有副作用（新节点超时概率更高，单节点成本约 1.8 倍，设 budget 不一定更快）与「没测 ≠ 不可用」说明 |
