@@ -717,21 +717,37 @@ def main():
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     checked = verdict["alive"] + verdict["dead"] + verdict["untested"]
 
-    # 连续升级重跑的闸门: 完整流水线一轮上百个请求, 不能每小时都跑一次。
-    # 超过 HEARTBEAT_ESCALATE_MAX 后仍然记录状态, 但不再重跑 —— 长期大面积失效是 12h 主流程的活,
-    # 每小时重跑只会把配额和 Actions 分钟数一起烧掉, 并不能让节点变活。
-    escalate_streak = (prev_escalate + 1) if verdict["outcome"] == "escalate" else 0
-    escalate_allowed = verdict["outcome"] == "escalate" and escalate_streak <= HEARTBEAT_ESCALATE_MAX
+    # 重跑闸门。两个要点:
+    #
+    # 1. hold 也要重跑。decide() 的 reason 里本来就写着「大面积失效应重跑完整流水线」,
+    #    而它先判 hold 再判 escalate —— 也就是说「摘了会低于 MIN_ALIVE」这个最严重的场景
+    #    全被 hold 兜住, 永远走不到 escalate。不改这一处, 文案说该重跑、代码却不重跑。
+    # 2. 只有「真的测完且没触发失效闸门」(ok / pruned) 才清零计数。
+    #    notest (一个都没测成) 既证明不了失效也证明不了恢复, 清零等于让证据凭空消失 ——
+    #    与 decide() 对 untested 的口径一致。
+    #
+    # 完整流水线一轮上百个请求, 不能每小时都跑, 所以两种失效共用同一道计数与冷却。
+    rerun = verdict["outcome"] in ("escalate", "hold")
+    if rerun:
+        escalate_streak = prev_escalate + 1
+    elif verdict["outcome"] in ("ok", "pruned"):
+        escalate_streak = 0
+    else:
+        escalate_streak = prev_escalate
+    escalate_allowed = rerun and escalate_streak <= HEARTBEAT_ESCALATE_MAX
     outcome, reason = verdict["outcome"], verdict["reason"]
-    if outcome == "escalate" and not escalate_allowed:
+    if rerun and not escalate_allowed:
         outcome = "escalate_cooldown"
-        reason = (f"{reason}; 已连续 {escalate_streak} 轮触发升级, 超过 HEARTBEAT_ESCALATE_MAX="
+        reason = (f"{reason}; 已连续 {escalate_streak} 轮触发重跑, 超过 HEARTBEAT_ESCALATE_MAX="
                   f"{HEARTBEAT_ESCALATE_MAX}, 本轮只记录不重跑 (等 check.yml 的 12h 主流程)")
 
     status = {
         "generated_at": ts,
         "duration_s": round(time.time() - started, 1),
         "outcome": outcome,
+        # verdict 是 decide() 的原始判定, outcome 是叠加冷却后的结论 ——
+        # 进冷却时只看 outcome 会丢掉「到底是死亡占比过高、还是摘了低于下限」。
+        "verdict": verdict["outcome"],
         "reason": reason,
         "changed": bool(verdict["prune"]),
         "published_nodes": len(items),
@@ -769,7 +785,9 @@ def main():
         if problems:
             # 自检不过就不写: 宁可这轮不摘, 也不能把坏产物发出去。
             vg.warn(f"摘除后的 nodes.txt 未通过格式自检, 放弃本次改写: {problems[0]}")
-            status.update({"outcome": "hold", "changed": False,
+            # 与 decide() 的 hold 区分开: 那个是「摘了会低于下限」(大面积失效),
+            # 这个是「改写后的产物不合格」。两者都不重跑, 但原因完全不同, 不该共用一个名字。
+            status.update({"outcome": "invalid_output", "changed": False,
                            "reason": f"摘除后产物格式自检未通过: {problems[0]}", "pruned": [], "pruned_count": 0})
         else:
             with open(os.path.join(vg.PUBLIC_DIR, NODES_FILENAME), "w", encoding="utf-8") as f:

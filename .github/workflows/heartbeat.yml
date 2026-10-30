@@ -80,7 +80,10 @@ jobs:
             exit 1
           fi
           if [ "$code" = "3" ]; then
-            echo "::warning::样本确认不通比例过高 — 交下一步完整重跑, 本轮不做部分摘除"
+            # 两种大面积失效共用这一个出口: 死亡占比过半 (escalate), 或摘了会低于 MIN_ALIVE (hold)。
+            # hold 比 escalate 更严重 —— decide() 先判 hold 再判 escalate, 不把它算进来,
+            # 最严重的场景反而永远不重跑。
+            echo "::warning::大面积失效 (死亡占比过高, 或摘后低于下限) — 交下一步完整重跑, 本轮不做部分摘除"
           fi
           if [ "$code" = "4" ]; then
             # 临时故障 (503/超时) 不是故障工单, 是「这一小时不发布」: 缺文件的整站部署会删线上文件。
@@ -88,6 +91,8 @@ jobs:
           fi
 
       # 只在"大面积失效"时升级: 部分摘除治不了病根, 需要重新抓源 + 重新检测。
+      # 触发条件是 escalate (单轮死亡占比过半) 或 hold (摘了会低于 MIN_ALIVE) ——
+      # 后者更严重, 而 decide() 先判 hold, 所以不把它算进来就等于漏掉最极端的场景。
       # 这一步故意不 fail-fast —— 完整重跑失败时, 部署上一步摘好的心跳产物仍比不部署好。
       - name: 升级为完整重跑
         if: steps.hb.outputs.escalate == 'true'

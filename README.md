@@ -219,16 +219,24 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 
 ### 规模假设（先看这一条，再决定要不要开）
 
-`auto` 预算优先「**一轮全测**」：`N ≤ HEARTBEAT_BUDGET_CEIL`（默认 48）时每轮测完所有节点，
-确认窗口就是 `confirm` 小时。分批是有代价的 —— 同样是 N=17，`budget=12` 时
-`ceil(17/12) × 2 = 4h` 才凑够确认，一轮全测只要 2h，而「窗口短」正是心跳存在的全部意义。
+`auto` 是**分段**的，不是一条公式。写成一条会在 N 大小时算错：
 
-`N > 48` 才退回分批，按 `ceil(N / (12/confirm))` 反推，保证 `ceil(N/budget) × confirm ≤ 12`：
+```text
+N ≤ CEIL（默认 48）:  budget = max(FLOOR, N)                          # 一轮全测
+N > CEIL:             budget = min(CEIL, ceil(N / (12 / confirm)))     # 按 12h 窗口分摊
+```
+
+第一段存在的理由：分批有代价。同样是 N=17，`budget=12` 要 `ceil(17/12) × 2 = 4h` 才凑够确认，
+一轮全测只要 2h，而「窗口短」正是心跳存在的全部意义。
+
+**注意第二段只在 `N > CEIL` 时生效。** 如果拿它去算 N=48，会得到 `min(48, ceil(48/6)) = 8` ——
+和实际行为（48）差 6 倍。先判 N 落在哪一段，再套公式。
 
 | N（线上节点数） | auto 取值 | 覆盖一轮 | 2 轮确认 | 结论 |
 | ---: | ---: | ---: | ---: | :--- |
 | 17 | 17（全测） | 1h | 2h | 一轮测完 |
 | 48 | 48（全测） | 1h | 2h | 一轮测完 |
+| 49 | 9 → 12（下限） | 5h | 10h | 刚过第一段边界 |
 | 100 | 17 | 6h | 12h | 刚好压进发布周期 |
 | 200 | 34 | 6h | 12h | 刚好压进发布周期 |
 | **288** | 48 | 6h | 12h | **auto 的硬边界** |
@@ -260,19 +268,60 @@ Pages 部署是**整站替换**：谁部署，站点上就只剩谁的 `public/`
 | ---: | :--- | :--- |
 | `0` | 正常（可能没有任何改动，见 `heartbeat.json.changed`） | 照常部署 |
 | `1` | 拿不到线上 `nodes.txt` | `::error::`，跳过部署，线上保持原样 |
-| `3` | 样本死亡占比过高，建议完整重跑 | 同一次运行内执行 `vpngate.py`，再部署 |
+| `3` | 大面积失效：单轮死亡占比过半（`escalate`），或摘了会低于 `MIN_ALIVE`（`hold`） | 同一次运行内执行 `vpngate.py`，再部署 |
 | `4` | 镜像站点时遇到临时读取失败（503/超时/空 body） | `::warning::`，跳过部署，下一小时自动重试 |
 
 `3` 是**在同一份 workflow 里**跑 `python vpngate.py`，不用 `workflow_dispatch`（那需要
-`actions: write`，容易踩 403），也不靠空 commit 触发。连续 `HEARTBEAT_ESCALATE_MAX`（默认 2）次
-之后进入 `escalate_cooldown`，把长期大面积失效交回给 12 小时主流程 —— 否则一批长期死透的节点会让
-每小时都烧一遍上百个请求。
+`actions: write`，容易踩 403），也不靠空 commit 触发。
 
-**冷却期间仍然检测。** 冷却的目的是「别再每小时跑一遍完整流水线」，不是「别再看了」：`cooldown`
-只关掉重跑那一步，采样、判定、写 `heartbeat.json` / 时序记录照常。代价是每小时十几次 Worker
-请求（相对完整流水线的上百次可以忽略），换来的是冷却结束时立刻知道当前状态，而不是两眼一黑。
-注意 `escalate` 分支本身是**不摘任何节点**的（`decide()` 在 `ratio > max_dead_ratio` 时返回空的
-`prune`）—— 大面积失效要靠重新抓源，不是就地砍订阅。
+**两种大面积失效共用这一个出口**：`escalate`（单轮死亡占比过半）与 `hold`（摘了会低于
+`HEARTBEAT_MIN_ALIVE`）。`decide()` 先判 `hold` 再判 `escalate`，所以最严重的场景全被 `hold`
+兜住 —— 只让 `escalate` 重跑，等于漏掉最该重跑的那一档。
+
+### 冷却：是持续态，不是时长
+
+这里**没有** `HEARTBEAT_ESCALATE_COOLDOWN` 这个变量。所谓冷却不是「停 6 小时」，而是
+「计数超过 `HEARTBEAT_ESCALATE_MAX` 之后，每一轮都只记录、不重跑」，直到某一轮恢复正常：
+
+```text
+escalate_streak 的变化规则
+  escalate / hold   -> +1        (大面积失效，累加)
+  ok / pruned       -> 0         (真的测完了，且没触发失效闸门 —— 只有这才算恢复)
+  notest            -> 保持不变   (一个都没测成：既证明不了失效，也证明不了恢复)
+```
+
+`notest` 不清零这一条容易被忽略，但后果很实在：Worker 抽风一小时 → 攒够的计数归零 → 又要重数两轮。
+这与 `decide()` 里「未测不该让死链计数凭空复活」是同一条原则 —— 没测成不等于好了。
+
+于是「节点长期大面积死透」时的行为是：**每小时检测（照常）、每轮判 `escalate_cooldown`（不重跑）、
+计数继续累加**，直到 `check.yml` 的 12 小时主流程重新抓源。这是一个稳定态，不是 bug。成本是每小时
+十几次 Worker 请求（相对完整流水线的上百次可忽略），换来的是恢复后立刻能确认，而不是两眼一黑。
+
+节点真的恢复后（`ratio` 回落到阈值以下、或摘除不再跌破下限），那一轮判 `ok`/`pruned`，计数清零，
+心跳回到正常摘除逻辑。
+
+**冷却期间仍然检测。** 冷却的目的是「别再每小时跑一遍完整流水线」，不是「别再看了」：只关掉重跑
+那一步，采样、判定、写 `heartbeat.json` / 时序记录照常。另外 `escalate` 与 `hold` 都**不摘任何
+节点**（`decide()` 在这两种情况下都返回空的 `prune`）—— 大面积失效要靠重新抓源，不是就地砍订阅。
+
+### 怎么读 `heartbeat.json`
+
+| 字段 | 取值 | 含义 |
+| :--- | :--- | :--- |
+| `outcome` | `ok` / `pruned` / `hold` / `notest` / `invalid_output` / `escalate` / `escalate_cooldown` | 本轮**结论**（已叠加冷却） |
+| `verdict` | 同上，但没有 `escalate_cooldown` / `invalid_output` | `decide()` 的原始判定。进冷却后 `outcome` 会变成 `escalate_cooldown`，靠它才能知道「为什么」 |
+| `escalate_streak` | 整数 | 连续大面积失效的轮数；`ok`/`pruned` 清零，`notest` 保持 |
+| `untested_ratio` | 0–1 | 持续 > 0.3 说明大量请求被判 `worker_error`/熔断，心跳在「只测不摘」 |
+
+七个 `outcome` 的区别：
+
+- `ok` —— 测完了，没有达到确认阈值的节点，不动手
+- `pruned` —— 摘掉了确认失效的节点
+- `hold` —— 该摘，但摘了会低于 `HEARTBEAT_MIN_ALIVE`（**这是最严重的一档**，会触发重跑）
+- `notest` —— 一个都没测成（检测端不可用 / 全被熔断），本轮无结论
+- `invalid_output` —— 改写后的 `nodes.txt` 没过格式自检，放弃本次改写（重跑也修不了格式问题，所以不重跑）
+- `escalate` —— 单轮死亡占比超阈值，触发重跑
+- `escalate_cooldown` —— 计数已超 `HEARTBEAT_ESCALATE_MAX`，只记录、不重跑
 
 ### 「线上没有」和「这次没读到」不是一回事
 
@@ -333,14 +382,14 @@ Pages 部署是**整站替换**：谁部署，站点上就只剩谁的 `public/`
 
 | 名称 | 默认值 | 说明 |
 | :--- | :--- | :--- |
-| `HEARTBEAT_BUDGET` | `auto` | 单轮复检数；`auto` 按节点数反推（下限 12 / 上限 48） |
+| `HEARTBEAT_BUDGET` | `auto` | 单轮复检数。`auto` 分段：`N ≤ CEIL` → `max(FLOOR, N)`；`N > CEIL` → `min(CEIL, ceil(N/(12/confirm)))` |
 | `HEARTBEAT_BUDGET_FLOOR` / `_CEIL` | `12` / `48` | `auto` 的上下限 |
 | `HEARTBEAT_CONCURRENCY` | `2` | 并发，必须低于主流程 |
 | `HEARTBEAT_TIMEOUT` | `30` | 单次复检超时（秒），压过 10 分钟会与下一轮重叠 |
 | `HEARTBEAT_CONFIRM` | `2` | 连续 N 轮确认才摘除 |
 | `HEARTBEAT_MIN_ALIVE` | `MIN_SUCCESS` | 摘除后剩余下限，低于此值不动手 |
 | `HEARTBEAT_MAX_DEAD_RATIO` | `0.5` | 单轮确认不通占比超过该值 → 升级为完整重跑 |
-| `HEARTBEAT_ESCALATE_MAX` | `2` | 连续触发几次完整重跑后进入冷却（冷却期间仍检测，只是不重跑） |
+| `HEARTBEAT_ESCALATE_MAX` | `2` | 连续几轮大面积失效后停止重跑。**冷却没有时长**，是「超过后每轮都只记录」的持续态 |
 | `HEARTBEAT_HISTORY_MAX` | `auto` | 时序记录保留行数；`auto` = 每轮行数 × 24 × 天数，`0` 关闭 |
 | `HEARTBEAT_HISTORY_DAYS` | `7` | `auto` 的目标保留天数 |
 | `HEARTBEAT_HISTORY_FLOOR` | `4000` | `auto` 的行数下限（小站点不会少于这个） |
@@ -543,6 +592,7 @@ PYTHONPATH=tests python -m unittest discover -s tests -p "test_heartbeat*.py" -v
 
 | 日期 | 版本 | 变更 |
 | :--- | :--- | :--- |
+| 2026-10-30 | v1.7.3 | **冷却语义与重跑闸门修正**（三轮评审）：① `hold`（摘了会低于 `MIN_ALIVE`）现在**也会触发完整重跑** —— `decide()` 先判 `hold` 再判 `escalate`，只让 `escalate` 重跑等于漏掉最严重的一档，而它的 `reason` 里本来就写着「应重跑完整流水线」；② `notest`（一个都没测成）不再清零 `escalate_streak`，`hold` 也不再清零而是累加 —— 只有 `ok`/`pruned` 算恢复，与 `decide()` 对「未测」的口径一致；③ `heartbeat.json` 新增 `verdict` 字段保留 `decide()` 原始判定（进冷却后 `outcome` 变 `escalate_cooldown`，否则「为什么进冷却」就丢了）；④ 产物格式自检失败改用 `outcome=invalid_output`，不再与 `decide()` 的 `hold` 混用同一个名字（前者重跑也没用，后者重跑才是解法）；⑤ README 写明**冷却没有时长**（是「计数超 `MAX` 后每轮只记录」的持续态，不是「停 6 小时」）、`streak` 三条变化规则、七种 `outcome` 的含义；⑥ README 把 `auto` 预算写成**分段公式**并补 N=49 的边界行 —— 用单一公式算 N=48 会得到 8，与实际 48 差 6 倍。测试 68 → 71 |
 | 2026-10-30 | v1.7.2 | **规模与失败可见性收口**（二轮评审）：① `auto` 预算改为优先「一轮全测」—— `N ≤ CEIL` 时每轮测完全部节点，确认窗口 = `confirm` 小时（N=17 从 4h 缩到 2h），`N > CEIL` 才分批；② 把 `auto` 的**硬边界 288**（`CEIL × 12 / confirm`）写进 README 并用 `test_auto_has_a_hard_validity_ceiling_at_288` 钉住，避免「auto 永远有效」的误读；③ `check.yml` 的 `Preserve heartbeat state` 区分 `404/410`（真没有，静默）与其它码（读失败，`::warning::`），并注释了「必须在 `vpngate.py` 之后、`Upload Pages artifact` 之前」的顺序约束；④ `load_prev_heartbeat()` 在「有已发布节点却读不到状态」时告警 —— 状态被清空会让 `streak` 归零、功能静默退化，而表面上一切正常；⑤ 时序记录上限改 `auto`（每轮行数 × 24 × 天数，下限 4000）：固定 4000 在「一轮全测 48 个」时只够 3.5 天，「保留约两周」必须由 N 决定；⑥ `_status_of` 补 `exc.response.status_code` 一级并加词边界（`requests.HTTPError` 只挂 `response`），`403/401/429` 明确归「读失败」而非「缺失」；⑦ README 写明 `escalate_cooldown` 期间**仍然检测**，只关掉重跑。测试 54 → 68（新增 288 边界、一轮全测、403/401/429 归因、状态码三级取值、行数上限换算、状态缺失告警与其静默边界） |
 | 2026-10-30 | v1.7.1 | **心跳的规模与状态修正**（评审 P0/P1）：① `check.yml` 新增 `Preserve heartbeat state` —— Pages 是整站替换，原先每次 check 发布都会把 `heartbeat.json` 连同死链证据一起清掉，`confirm=2` 在 `ceil(N/budget) > 6` 时永远凑不齐（症状是「每小时都在跑、从来不摘」）；② 预算支持 `HEARTBEAT_BUDGET=auto`，按 `ceil(N/(12/confirm))` 反推（下限 12 / 上限 48），超出发布周期时写 `scale_warning` 并告警；③ 退出码 `4` 区分「线上没有这个文件」(404，允许继续) 与「这次没读到」(5xx/超时/200+空 body，禁止部署) —— `vg._http_get` 对 4xx 是抛 `_NoRetryHTTPError`，404 判断必须从异常里取状态码才生效（冒烟抓到）；④ 连续 `HEARTBEAT_ESCALATE_MAX` 次完整重跑后进入 `escalate_cooldown`，不再每小时烧一遍上百请求；⑤ 新增 `heartbeat-history.jsonl` 时序记录（每轮每节点一行，默认保留 4000 行，读失败则整轮不写，避免覆盖已攒数据）；⑥ `heartbeat.json` 增加 `untested_ratio` / `escalate_streak` / `staging_missing` / `staging_errors` / `budget_auto`。测试 30 → 54 个（新增镜像失败分支、预算伸缩、升级冷却、时序裁剪与「常量与使用点形状」结构断言） |
 | 2026-10-30 | v1.7.0 | **新增发布后心跳**（`heartbeat.py` + `heartbeat.yml`）：每小时复检线上 `nodes.txt`，把连续 `HEARTBEAT_CONFIRM` 轮确认不通的节点摘掉并重发，把「发布后 12 小时空窗」压到 1 小时。三条硬约束：只摘 `failure_kind=node_dead`（`target_ratelimit`/`worker_error` 一律保留，未测不等于不通）、证据跨轮累积且当轮必须仍是 `node_dead`（旧证据不能支撑摘除动作）、摘后低于 `HEARTBEAT_MIN_ALIVE` 或单轮死亡占比超 `HEARTBEAT_MAX_DEAD_RATIO` 则改用退出码 3 触发完整重跑。复用 `vpngate.check_one`/`PortCircuitBreaker`/`AdaptiveLimiter`，归因与熔断口径零分叉；部署前先镜像线上整站产物（Pages 部署是整站替换，漏镜像会把 `index.html`/`check-worker.js` 从线上删掉）；`data.json` 同步裁剪且 `raw_nodes`/`checked` 等「那一轮」字段保持原值，心跳结论独立写 `heartbeat.json`，不改 `status.json`。新增 30 个离线用例（`test_heartbeat.py` 判定边界 + `test_heartbeat_flow.py` 全流程落盘） |

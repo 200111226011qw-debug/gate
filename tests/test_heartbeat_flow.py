@@ -239,6 +239,50 @@ class FlowTest(unittest.TestCase):
         self.assertEqual(hb.main(), 0)
         self.assertEqual(json.loads(self._read("heartbeat.json"))["escalate_streak"], 0)
 
+    def test_hold_triggers_rerun_not_just_escalate(self):
+        """hold 是「摘了会低于 MIN_ALIVE」, 比 escalate 更严重, 必须同样触发重跑。
+
+        decide() 的 reason 里写着「大面积失效应重跑完整流水线」, 但它先判 hold 再判 escalate ——
+        最严重的场景全被 hold 兜住, 永远走不到 escalate。不把 hold 纳入闸门, 那句 reason 就是假的。
+        """
+        self.dead_hosts = frozenset({"10.0.0.1"})
+        hb.HEARTBEAT_CONFIRM = 1
+        hb.HEARTBEAT_MIN_ALIVE = 8        # 摘 1 个后剩 7 < 8 -> hold
+        hb.HEARTBEAT_MAX_DEAD_RATIO = 1.0  # 别让 ratio 先触发 escalate, 这条测的是 hold
+        self.assertEqual(hb.main(), 3, "hold 也要返回 3 让 workflow 重跑")
+        status = json.loads(self._read("heartbeat.json"))
+        self.assertEqual(status["outcome"], "hold")
+        self.assertEqual(status["verdict"], "hold")
+        self.assertEqual(status["escalate_streak"], 1)
+        self.assertEqual(self._read("nodes.txt"), NODES, "hold 不就地砍订阅")
+
+    def test_notest_does_not_reset_escalate_streak(self):
+        """一个都没测成: 既证明不了失效, 也证明不了恢复 —— 计数必须原地保留。
+
+        清零的后果是「Worker 抽风一小时 -> 攒够的证据全没了 -> 又要重数两轮」,
+        与 decide() 里「未测不该让 dead 计数凭空复活」是同一条原则。
+        """
+        self.remote["heartbeat.json"] = json.dumps(
+            {"dead_streak": {}, "cursor": 0, "escalate_streak": 2})
+        # 空结果 = 一个也没测成
+        hb.check_batch = lambda targets, session, breaker: ({}, _Limiter())
+        self.assertEqual(hb.main(), 0)
+        status = json.loads(self._read("heartbeat.json"))
+        self.assertEqual(status["outcome"], "notest")
+        self.assertEqual(status["escalate_streak"], 2, "notest 不该清零")
+
+    def test_cooldown_keeps_original_verdict(self):
+        """进冷却后 outcome 变成 escalate_cooldown, 但原始判定必须留下来可查。"""
+        hb.HEARTBEAT_MAX_DEAD_RATIO = 0.5
+        hb.HEARTBEAT_ESCALATE_MAX = 1
+        self.remote["heartbeat.json"] = json.dumps(
+            {"dead_streak": {}, "cursor": 0, "escalate_streak": 1})
+        self.dead_hosts = frozenset({"10.0.0.2", "10.0.0.3", "10.0.0.4", "10.0.0.5", "10.0.0.6"})
+        self.assertEqual(hb.main(), 0)
+        status = json.loads(self._read("heartbeat.json"))
+        self.assertEqual(status["outcome"], "escalate_cooldown")
+        self.assertEqual(status["verdict"], "escalate", "冷却不该抹掉「为什么进冷却」")
+
     # --- 预算随节点数伸缩 ---
     def test_auto_budget_scales_with_node_count(self):
         many = "\n".join(f"cf.example.com:443#日本-住宅-{i:03d}$sstp://vpn:vpn@10.1.0.{i % 250}:443"
