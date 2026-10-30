@@ -427,13 +427,13 @@ escalate_streak 的变化规则
 PYTHONPATH=tests python -m unittest discover -s tests -p "test_heartbeat*.py" -v
 ```
 
-### 本地提交约定（这几条是事故换来的）
+### 本地提交与推送约定（这几条是事故换来的）
 
 2026-10-30 有一次 `git add -A` 把 `PUBLIC_DIR=.smokeN` 的整站产物提交进了分支，其中含
 `check-worker.js` 的第三方副本。它**同时通过了所有检查**：`git status` 干净、测试全绿、CI 也会绿 ——
 因为这类错误只影响仓库卫生，没有任何自动化在管。最后靠 `git filter-branch` 重写历史才清掉。
 
-所以约定三条：
+所以约定四条：
 
 1. **暂存用 pathspec，不要用 `git add -A`**。`.gitignore` 的注释不是防线 —— 那次事故时注释就写在那儿。
 2. **提交前核对文件清单**：`git diff --cached --stat`。`git status` 干净不代表提交干净，
@@ -455,8 +455,43 @@ PYTHONPATH=tests python -m unittest discover -s tests -p "test_heartbeat*.py" -v
    前者能兜底但已经污染了远程历史（要 `filter-branch` 才清得掉），后者拦住就不会走到那一步。
    所以 hook 是主力，CI 是兜底 —— 反过来说「入库了就等于有防线」是错的。
 
+4. **验证推送看远端哈希，不看 `git push` 的退出码。**
+
+   ```bash
+   git ls-remote --heads origin | grep <branch>
+   # 与 git rev-parse HEAD 对得上，才算真的推上去了
+   ```
+
+   理由：分几次推送时，`push` 的退出码只反映那一次尝试。很容易出现「以为推了、实际只推了前几个提交」
+   的错觉。`ls-remote` 看的是远端最终状态，这是唯一可靠的信号 —— 和「验证补丁看 `numstat`
+   而不是看 diff 长得对不对」是同一种思路：**看最终状态，不看过程信号**。
+
 顺带：冒烟目录请用 `PUBLIC_DIR=.smokeN`，已被 `.gitignore` 忽略；删它用 `rm -rf .smokeN`，
 别等攒到一起再 `git add -A`。
+
+### 四类「不报错」的失败，以及各自的防线
+
+功能缺陷至少有测试兜底；下面四类**不报错、不崩溃、测试全绿、日志好看**，只能靠主动核对最终状态：
+
+| 类别 | 表现 | 本项目的实例 | 防线 |
+| :--- | :--- | :--- | :--- |
+| **文案与行为分叉** | `reason` 说应该 X，代码做 Y | `hold` 的 reason 写着「应重跑完整流水线」，代码返回 0 | 端到端测试断言「返回值之后主流程做了什么」 |
+| **状态名借用** | 用别的状态名描述本状态 | `notest` 若写成 `escalate_cooldown`，会把排查从「查 Worker」引向「查节点」 | 端到端测试连跑 N 轮，断言状态不伪装 |
+| **结果对路径偶然** | 行为对，但依赖执行顺序 | `invalid_output` 的 `escalate_streak` 清零靠的是「先算 streak、后改 status」 | 显式赋值替代顺序依赖 |
+| **仓库卫生** | `git status` 干净、测试全绿 | `git add -A` 把 `.smoke*` 带进提交 | hook（推前）+ CI 检查（推后） |
+
+共同点：**都只能靠「主动核对最终状态」发现** —— 端到端跑一遍 `main()`、看 `git diff --cached --stat`、
+历史清理三条命令一起查、`ls-remote` 比对远端。
+
+> 能被测试覆盖的用测试兜，覆盖不到的用 hook 兜，两者都兜不住的才是真正的风险。
+
+历史清理为什么必须三条一起查（少一条会得出相反的结论）：
+
+| 命令 | 查什么 | 单独查会漏掉什么 |
+| :--- | :--- | :--- |
+| `git rev-list --objects --all \| grep <pattern>` | 对象库 | `refs/original/` 还挂着时，对象可能已被 gc，显示空但历史不空 |
+| `git log --all --name-only \| grep <pattern>` | 提交历史 | 引用全删但对象还在时，显示空但实际没清干净 |
+| `git ls-remote --heads origin` | 远端实际状态 | 本地干净但没推上去，本地查什么都干净 |
 
 ---
 
