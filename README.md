@@ -451,6 +451,12 @@ PYTHONPATH=tests python -m unittest discover -s tests -p "test_heartbeat*.py" -v
    它查 `git log --all --name-only`，所以 Checkout 用了 `fetch-depth: 0`
    （默认 depth 1 只看得到最近一个提交，拦不住「前两个提交带了冒烟产物」）。
 
+   > **`fetch-depth: 0` 的代价可以忽略，但不是永久的。** 实测当前工作树 1.2 MB、最大单文件
+   > 86 KB（`vpngate.py`），完整克隆在秒级。如果仓库涨到 ~100 MB（比如把
+   > `heartbeat-history.jsonl` 的历史归档也入库 —— 现在它只在 Pages 上，不入库），
+   > 可以改成 `fetch-depth: 50`：覆盖最近 50 个提交，仍能拦住「本次 PR 的提交带了冒烟产物」，
+   > 只是拦不住更早的历史。**这是一条未来优化，不是现在的待办。**
+
    两道防线的分工要说清：**CI 拦的是「推上去之后」，hook 拦的是「推之前」。**
    前者能兜底但已经污染了远程历史（要 `filter-branch` 才清得掉），后者拦住就不会走到那一步。
    所以 hook 是主力，CI 是兜底 —— 反过来说「入库了就等于有防线」是错的。
