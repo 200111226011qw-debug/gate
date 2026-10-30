@@ -787,7 +787,12 @@ def main():
             vg.warn(f"摘除后的 nodes.txt 未通过格式自检, 放弃本次改写: {problems[0]}")
             # 与 decide() 的 hold 区分开: 那个是「摘了会低于下限」(大面积失效),
             # 这个是「改写后的产物不合格」。两者都不重跑, 但原因完全不同, 不该共用一个名字。
+            #
+            # escalate_streak 在上面已经按 verdict=pruned 走到 0 (检测本身是完成的, 只是产物
+            # 写坏了)。这里**显式再写一次**: 上面那次清零是「顺序恰好」, 一旦以后有人把
+            # 这一段挪到 streak 计算之前, 行为就变了。显式赋值把偶然变成必然。
             status.update({"outcome": "invalid_output", "changed": False,
+                           "escalate_streak": 0,
                            "reason": f"摘除后产物格式自检未通过: {problems[0]}", "pruned": [], "pruned_count": 0})
         else:
             with open(os.path.join(vg.PUBLIC_DIR, NODES_FILENAME), "w", encoding="utf-8") as f:

@@ -287,8 +287,12 @@ Pages 部署是**整站替换**：谁部署，站点上就只剩谁的 `public/`
 escalate_streak 的变化规则
   escalate / hold   -> +1        (大面积失效，累加)
   ok / pruned       -> 0         (真的测完了，且没触发失效闸门 —— 只有这才算恢复)
+  invalid_output    -> 0         (检测完成了，只是写出来的产物不合格；不算失效)
   notest            -> 保持不变   (一个都没测成：既证明不了失效，也证明不了恢复)
 ```
+
+`invalid_output` 的归属容易含糊，所以代码里是**显式赋值**而不是靠计算顺序：它上面那次清零来自
+`verdict == "pruned"`，属于「顺序恰好」，一旦有人把改写产物的那段挪到 streak 计算之前，行为就变了。
 
 `notest` 不清零这一条容易被忽略，但后果很实在：Worker 抽风一小时 → 攒够的计数归零 → 又要重数两轮。
 这与 `decide()` 里「未测不该让死链计数凭空复活」是同一条原则 —— 没测成不等于好了。
@@ -330,7 +334,8 @@ escalate_streak 的变化规则
   重跑是重新抓源，就地砍订阅只会让节点数掉到下限以下。这是最严重的一档。
 - `notest` —— 一个都没测成（检测端不可用 / 全被熔断）。**不摘、不重跑、`streak` 保持不变**，
   本轮无结论
-- `invalid_output` —— 改写后的 `nodes.txt` 没过格式自检，放弃本次改写（重跑也修不了格式问题，所以不重跑）
+- `invalid_output` —— 改写后的 `nodes.txt` 没过格式自检，放弃本次改写，原文一字不动。
+  **不重跑**（重跑修不了格式），但 `escalate_streak` **清零** —— 检测本身完成了，只是产物不合格
 - `escalate` —— 单轮死亡占比超阈值，触发重跑
 - `escalate_cooldown` —— 计数已超 `HEARTBEAT_ESCALATE_MAX`，只记录、不重跑
 
@@ -603,6 +608,7 @@ PYTHONPATH=tests python -m unittest discover -s tests -p "test_heartbeat*.py" -v
 
 | 日期 | 版本 | 变更 |
 | :--- | :--- | :--- |
+| 2026-10-30 | v1.7.5 | **`invalid_output` 的计数归属写死**（五轮评审）：① `escalate_streak` 对它**显式赋 0**，不再依赖「`verdict=pruned` 先算、`status` 后改」这个顺序巧合 —— 原来行为是对的，但把「改写产物」那段挪到 streak 计算之前就会变；② README 的 `streak` 规则表补上 `invalid_output -> 0` 一行并说明理由（检测本身完成，只是产物不合格，不算失效）；③ 新增**真实可触发**的端到端用例：`abc#...@abc:443` 这种没有点的主机名能过 `NODE_LINE_RE` 但过不了 `validate_nodes_text`，一行即可触发该分支，断言 `outcome=invalid_output` / `exit 0` / `nodes.txt` 一字不动 / `pruned_count=0` / `escalate_streak=0`。测试 72 → 73 |
 | 2026-10-30 | v1.7.4 | **两个边界收口**（四轮评审）：① `hold` 时 `prune` **本来就是空集**（`decide()` 返回 `"prune": set()`），所以重跑闸门放开后不会出现「摘到低于 `MIN_ALIVE`」—— 已在 README 的 `outcome` 表里写明「不摘任何节点」，并保留 `test_hold_triggers_rerun_not_just_escalate` 的 `nodes.txt` 断言；② README 补「连续 `notest`」的行为：`outcome` 如实写 `notest`，**不会**变成 `escalate_cooldown`（冷却只在「本轮真判失效且超限」时出现），`escalate_streak` 原样保持；并说明由此带来的取舍 —— 旧证据只会导致「少做」不会导致「乱做」，最长延迟一个发布周期，由 `check.yml` 兜底。测试 71 → 72（连跑 3 轮 `notest` 验证计数不变、状态不伪装） |
 | 2026-10-30 | v1.7.3 | **冷却语义与重跑闸门修正**（三轮评审）：① `hold`（摘了会低于 `MIN_ALIVE`）现在**也会触发完整重跑** —— `decide()` 先判 `hold` 再判 `escalate`，只让 `escalate` 重跑等于漏掉最严重的一档，而它的 `reason` 里本来就写着「应重跑完整流水线」；② `notest`（一个都没测成）不再清零 `escalate_streak`，`hold` 也不再清零而是累加 —— 只有 `ok`/`pruned` 算恢复，与 `decide()` 对「未测」的口径一致；③ `heartbeat.json` 新增 `verdict` 字段保留 `decide()` 原始判定（进冷却后 `outcome` 变 `escalate_cooldown`，否则「为什么进冷却」就丢了）；④ 产物格式自检失败改用 `outcome=invalid_output`，不再与 `decide()` 的 `hold` 混用同一个名字（前者重跑也没用，后者重跑才是解法）；⑤ README 写明**冷却没有时长**（是「计数超 `MAX` 后每轮只记录」的持续态，不是「停 6 小时」）、`streak` 三条变化规则、七种 `outcome` 的含义；⑥ README 把 `auto` 预算写成**分段公式**并补 N=49 的边界行 —— 用单一公式算 N=48 会得到 8，与实际 48 差 6 倍。测试 68 → 71 |
 | 2026-10-30 | v1.7.2 | **规模与失败可见性收口**（二轮评审）：① `auto` 预算改为优先「一轮全测」—— `N ≤ CEIL` 时每轮测完全部节点，确认窗口 = `confirm` 小时（N=17 从 4h 缩到 2h），`N > CEIL` 才分批；② 把 `auto` 的**硬边界 288**（`CEIL × 12 / confirm`）写进 README 并用 `test_auto_has_a_hard_validity_ceiling_at_288` 钉住，避免「auto 永远有效」的误读；③ `check.yml` 的 `Preserve heartbeat state` 区分 `404/410`（真没有，静默）与其它码（读失败，`::warning::`），并注释了「必须在 `vpngate.py` 之后、`Upload Pages artifact` 之前」的顺序约束；④ `load_prev_heartbeat()` 在「有已发布节点却读不到状态」时告警 —— 状态被清空会让 `streak` 归零、功能静默退化，而表面上一切正常；⑤ 时序记录上限改 `auto`（每轮行数 × 24 × 天数，下限 4000）：固定 4000 在「一轮全测 48 个」时只够 3.5 天，「保留约两周」必须由 N 决定；⑥ `_status_of` 补 `exc.response.status_code` 一级并加词边界（`requests.HTTPError` 只挂 `response`），`403/401/429` 明确归「读失败」而非「缺失」；⑦ README 写明 `escalate_cooldown` 期间**仍然检测**，只关掉重跑。测试 54 → 68（新增 288 边界、一轮全测、403/401/429 归因、状态码三级取值、行数上限换算、状态缺失告警与其静默边界） |

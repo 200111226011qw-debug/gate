@@ -18,3 +18,8 @@ tests/_synthesized_*.py
 /2026-10-21.md
 /diag_check.py
 /_diag*/
+
+# 心跳冒烟产物: heartbeat.py 用 PUBLIC_DIR=.smokeX 跑出来的整站文件
+# (含从线上镜像回来的 check-worker.js 副本), 只用于本地验证, 不入库。
+# 教训: 不要用 `git add -A`, 它会把这类目录一起带上 —— 用 `git add <具体路径>`。
+/.smoke*/

@@ -271,6 +271,32 @@ class FlowTest(unittest.TestCase):
         self.assertEqual(status["outcome"], "notest")
         self.assertEqual(status["escalate_streak"], 2, "notest 不该清零")
 
+    def test_invalid_output_does_not_rewrite_and_resets_streak(self):
+        """产物格式自检失败: 不改写 nodes.txt、不重跑, escalate_streak 清零。
+
+        用真实可触发的输入, 不打桩 validate: `NODE_LINE_RE` 允许 `abc#...@abc:443` 这种
+        没有点的主机名, 而 `validate_nodes_text` 会拒绝它 (要求入口与主机都含 ".")。
+        于是一行「parse 能过、重写后不过」的节点就足以触发这个分支。
+
+        语义: 检测本身完成了, 只是写出来的产物不合格 —— 与 hold (摘了会低于下限) 不同,
+        重跑修不了格式, 所以不重跑; 但也是「测完了」, 所以计数清零。
+        """
+        bad_line = "abc#日本-住宅-999$sstp://vpn:vpn@abc:443"
+        bad = NODES + bad_line + "\n"
+        self.remote["nodes.txt"] = bad
+        self.dead_hosts = frozenset({"10.0.0.1"})
+        hb.HEARTBEAT_CONFIRM = 1
+        hb.HEARTBEAT_MIN_ALIVE = 1
+        self.remote["heartbeat.json"] = json.dumps(
+            {"dead_streak": {}, "cursor": 0, "escalate_streak": 5})
+        self.assertEqual(hb.main(), 0, "格式问题重跑也修不了, 不该触发重跑")
+        status = json.loads(self._read("heartbeat.json"))
+        self.assertEqual(status["outcome"], "invalid_output")
+        self.assertFalse(status["changed"])
+        self.assertEqual(status["pruned_count"], 0)
+        self.assertEqual(self._read("nodes.txt"), bad, "没过自检就不许改写, 原文一字不动")
+        self.assertEqual(status["escalate_streak"], 0, "检测完成了, 不算失效; 清零")
+
     def test_consecutive_notest_keeps_streak_and_is_not_cooldown(self):
         """连续 notest: 计数保持, 但 outcome 如实写 notest —— 不会伪装成 escalate_cooldown。
 
