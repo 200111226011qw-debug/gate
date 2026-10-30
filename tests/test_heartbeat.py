@@ -250,10 +250,14 @@ class BudgetTest(unittest.TestCase):
             for name, value in zip(self._FIELDS, self._saved):
                 setattr(hb, name, value)
 
-    def test_auto_keeps_floor_for_small_site(self):
+    def test_auto_full_sweep_when_small(self):
+        # N <= CEIL 时一轮全测: 确认窗口 = confirm 小时。
+        # 分批会让窗口成倍变长 (N=17 时 ceil(17/12)*2 = 4h), 而心跳的全部价值就是窗口短。
         self._with(HEARTBEAT_BUDGET_AUTO=True, HEARTBEAT_CONFIRM=2,
                    HEARTBEAT_BUDGET_FLOOR=12, HEARTBEAT_BUDGET_CEIL=48)
-        self.assertEqual(hb.resolve_budget(17), 12, "小站点不该被自动预算削到 12 以下")
+        self.assertEqual(hb.resolve_budget(17), 17)
+        self.assertEqual(hb.resolve_budget(48), 48)
+        self.assertEqual(hb.resolve_budget(5), 12, "低于下限时不该把预算降到 FLOOR 以下")
 
     def test_auto_scales_with_node_count(self):
         self._with(HEARTBEAT_BUDGET_AUTO=True, HEARTBEAT_CONFIRM=2,
@@ -265,6 +269,21 @@ class BudgetTest(unittest.TestCase):
         self._with(HEARTBEAT_BUDGET_AUTO=True, HEARTBEAT_CONFIRM=2,
                    HEARTBEAT_BUDGET_FLOOR=12, HEARTBEAT_BUDGET_CEIL=48)
         self.assertEqual(hb.resolve_budget(4000), 48, "上限用于兜住请求量, 不能随 N 无限增长")
+
+    def test_auto_has_a_hard_validity_ceiling_at_288(self):
+        """auto 不是「永远有效」: CEIL=48/confirm=2/周期 12h 时, N > 288 就无解。
+
+        288 = CEIL * PUBLISH_PERIOD_H / confirm。这个数字必须能被测试固定住,
+        否则一旦有人调小 CEIL 或调大 confirm, 「auto 就没事了」会变成静默错误。
+        """
+        self._with(HEARTBEAT_BUDGET_AUTO=True, HEARTBEAT_CONFIRM=2,
+                   HEARTBEAT_BUDGET_FLOOR=12, HEARTBEAT_BUDGET_CEIL=48)
+        n_max = hb.HEARTBEAT_BUDGET_CEIL * hb.PUBLISH_PERIOD_H // hb.HEARTBEAT_CONFIRM
+        self.assertEqual(n_max, 288)
+        # 边界当轮必须能压进发布周期
+        self.assertIsNone(hb.scale_warning(n_max, hb.resolve_budget(n_max)))
+        # 多一个节点就压不进去了 —— 必须告警, 不能假装还健康
+        self.assertIsNotNone(hb.scale_warning(n_max + 1, hb.resolve_budget(n_max + 1)))
 
     def test_fixed_budget_is_not_scaled(self):
         self._with(HEARTBEAT_BUDGET_AUTO=False, HEARTBEAT_BUDGET=12,
@@ -323,6 +342,81 @@ class FetchProbeTest(unittest.TestCase):
         state, detail = self._probe(200, boom=TimeoutError("timed out"))
         self.assertEqual(state, "error")
         self.assertIn("TimeoutError", detail)
+
+    def test_403_is_read_error_not_missing(self):
+        """403 是「有权限问题读不到」, 不是「没有这个文件」。
+
+        归错边的后果很具体: 当 missing 处理 -> 允许部署 -> 整站替换把那个文件从线上删掉。
+        """
+        self.assertEqual(self._probe(403)[0], "error")
+        self.assertEqual(self._probe(401)[0], "error")
+
+    def test_429_is_read_error(self):
+        # 429 是被限流: 文件存在, 这一瞬间拿不到。必须 error, 否则会覆盖/删除线上文件
+        self.assertEqual(self._probe(429)[0], "error")
+
+
+class StatusOfTest(unittest.TestCase):
+    """_status_of 的三级取值顺序。少一级就会让 408/429 失去诊断信息。"""
+
+    def test_reads_status_code_attribute(self):
+        exc = RuntimeError("whatever")
+        exc.status_code = 404
+        self.assertEqual(hb._status_of(exc), 404)
+
+    def test_reads_requests_style_response(self):
+        # requests.HTTPError 只挂 response, 没有 status_code
+        resp = type("R", (), {"status_code": 429})()
+        exc = RuntimeError("429 Too Many Requests")
+        exc.response = resp
+        self.assertEqual(hb._status_of(exc), 429)
+
+    def test_falls_back_to_message(self):
+        self.assertEqual(hb._status_of(hb.vg._NoRetryHTTPError("HTTP 404 (不重试)")), 404)
+        self.assertEqual(hb._status_of(RuntimeError("HTTP 502")), 502)
+
+    def test_word_boundary_does_not_invent_codes(self):
+        # 没有词边界的写法会把 "HTTP 5020" 截成 502, 于是一个奇怪的消息会被当成 5xx
+        self.assertIsNone(hb._status_of(RuntimeError("HTTP 50200 something")))
+
+    def test_unknown_is_none(self):
+        self.assertIsNone(hb._status_of(ValueError("network unreachable")))
+
+
+class HistoryMaxTest(unittest.TestCase):
+    """保留行数必须随 N 走: 固定 4000 在「一轮全测 48 个」时只够 3.5 天。"""
+
+    _FIELDS = ("HEARTBEAT_HISTORY_AUTO", "HEARTBEAT_HISTORY_MAX",
+               "HEARTBEAT_HISTORY_DAYS", "HEARTBEAT_HISTORY_FLOOR")
+
+    def tearDown(self):
+        if hasattr(self, "_saved"):
+            for name, value in zip(self._FIELDS, self._saved):
+                setattr(hb, name, value)
+
+    def _with(self, **kw):
+        self._saved = tuple(getattr(hb, f) for f in self._FIELDS)
+        for k, v in kw.items():
+            setattr(hb, k, v)
+
+    def test_auto_keeps_floor_for_small_n(self):
+        self._with(HEARTBEAT_HISTORY_AUTO=True, HEARTBEAT_HISTORY_DAYS=7,
+                   HEARTBEAT_HISTORY_FLOOR=4000)
+        self.assertEqual(hb.resolve_history_max(17), 4000, "小站点不该少于 4000 行")
+
+    def test_auto_scales_for_large_n(self):
+        self._with(HEARTBEAT_HISTORY_AUTO=True, HEARTBEAT_HISTORY_DAYS=7,
+                   HEARTBEAT_HISTORY_FLOOR=4000)
+        # 48 行/轮 x 24 轮/天 x 7 天 = 8064
+        self.assertEqual(hb.resolve_history_max(48), 8064)
+
+    def test_fixed_value_is_respected(self):
+        self._with(HEARTBEAT_HISTORY_AUTO=False, HEARTBEAT_HISTORY_MAX=1000)
+        self.assertEqual(hb.resolve_history_max(48), 1000)
+
+    def test_zero_disables(self):
+        self._with(HEARTBEAT_HISTORY_AUTO=False, HEARTBEAT_HISTORY_MAX=0)
+        self.assertEqual(hb.resolve_history_max(48), 0)
 
 
 if __name__ == "__main__":

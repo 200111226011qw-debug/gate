@@ -9,6 +9,8 @@
     PYTHONPATH=tests python -m unittest discover -s tests -p "test_heartbeat_flow.py" -v
 """
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -45,7 +47,8 @@ class _Limiter:
 class FlowTest(unittest.TestCase):
     _FIELDS = ("HEARTBEAT_BUDGET", "HEARTBEAT_CONCURRENCY", "HEARTBEAT_TIMEOUT",
                "HEARTBEAT_CONFIRM", "HEARTBEAT_MIN_ALIVE", "HEARTBEAT_MAX_DEAD_RATIO",
-               "HEARTBEAT_BUDGET_AUTO", "HEARTBEAT_ESCALATE_MAX", "HEARTBEAT_HISTORY_MAX")
+               "HEARTBEAT_BUDGET_AUTO", "HEARTBEAT_ESCALATE_MAX",
+               "HEARTBEAT_HISTORY_MAX", "HEARTBEAT_HISTORY_AUTO")
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
@@ -64,6 +67,9 @@ class FlowTest(unittest.TestCase):
         hb.HEARTBEAT_BUDGET_AUTO = False
         hb.HEARTBEAT_ESCALATE_MAX = 2
         hb.HEARTBEAT_HISTORY_MAX = 0          # 默认关: 时序记录单独测, 不污染其它用例的产物断言
+        # 单测要能直接钉住行数上限, 所以关掉 auto —— auto 的换算由 test_heartbeat 的
+        # HistoryMaxTest 单独覆盖, 否则「改 HEARTBEAT_HISTORY_MAX=3」会被 auto 静默忽略
+        hb.HEARTBEAT_HISTORY_AUTO = False
         self.probe_state = {}                  # name -> "missing" / "error"
         self.remote = {"nodes.txt": NODES, "data.json": json.dumps(DATA), **OTHER}
         self.remote["heartbeat.json"] = json.dumps({"dead_streak": {}, "cursor": 0})
@@ -258,6 +264,28 @@ class FlowTest(unittest.TestCase):
         status = json.loads(self._read("heartbeat.json"))
         self.assertIn("scale_warning", status, "N 超过 budget*6 时必须自己喊出来, 否则症状只是「从来不摘」")
         self.assertIn("只测不摘", status["scale_warning"])
+
+    def test_missing_state_with_published_nodes_warns(self):
+        """「首轮」和「状态被 check 部署清掉」单看文件分不出来, 但必须在日志里留痕。
+
+        否则最坏的情况是: check 的 preserve 步骤失败 -> streak 每 12 小时归零一次 ->
+        心跳永远凑不齐 confirm 轮 -> 每小时都在跑、从来不摘, 而两边日志全绿。
+        """
+        self.remote.pop("heartbeat.json", None)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):   # vg.warn 走的是 print() -> stdout
+            self.assertEqual(hb.main(), 0)
+        out = buf.getvalue()
+        self.assertIn("读不到 heartbeat.json", out)
+        self.assertIn("死链证据从零重攒", out)
+
+    def test_absent_state_on_empty_site_is_silent(self):
+        # 没有已发布节点时不该刷告警 (那才是真正的首轮 / 空站点)
+        self.remote.pop("heartbeat.json", None)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            hb.load_prev_heartbeat(None, 0)
+        self.assertNotIn("读不到 heartbeat.json", buf.getvalue())
 
     # --- 时序记录 ---
     def test_history_appended_and_trimmed(self):

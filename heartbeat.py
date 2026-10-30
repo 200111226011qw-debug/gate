@@ -110,9 +110,14 @@ HEARTBEAT_MAX_DEAD_RATIO = float(os.environ.get("HEARTBEAT_MAX_DEAD_RATIO", "0.5
 # 连续触发完整重跑的轮数上限: 超过后只记录不重跑, 把修复交回给 12 小时的 check.yml。
 # 没有这道闸, 一批长期死透的节点会让每小时都跑一遍上百请求的完整流水线。
 HEARTBEAT_ESCALATE_MAX = _env_int("HEARTBEAT_ESCALATE_MAX", 2, 0)
-# 单轮检测结果的时序记录 (JSONL): 0 = 关闭。每行一个节点, 用来把「按本轮延迟排序」
-# 换成「按历史存活率排序」; 攒数据本身零成本, 缺的是时间。
-HEARTBEAT_HISTORY_MAX = _env_int("HEARTBEAT_HISTORY_MAX", 4000, 0)
+# 单轮检测结果的时序记录 (JSONL): 0 = 关闭, auto = 按「每轮行数 x 24 x 天数」反推。
+# 写死行数是错的: 4000 行在 N=17 时够两周, 在 N=288、每轮全测时只够 3.5 天 ——
+# 「保留约两周」这句话必须由 N 决定, 而不是一个拍脑袋的常数。
+_HISTORY_RAW = (os.environ.get("HEARTBEAT_HISTORY_MAX") or "auto").strip().lower()
+HEARTBEAT_HISTORY_AUTO = _HISTORY_RAW in ("", "auto")
+HEARTBEAT_HISTORY_MAX = 0 if _HISTORY_RAW == "0" else _env_int("HEARTBEAT_HISTORY_MAX", 4000, 1)
+HEARTBEAT_HISTORY_DAYS = _env_int("HEARTBEAT_HISTORY_DAYS", 7, 1)
+HEARTBEAT_HISTORY_FLOOR = _env_int("HEARTBEAT_HISTORY_FLOOR", 4000, 1)
 
 # 发布周期 (小时): check.yml 的 cron 是 */12。只用于规模自检, 不影响调度。
 PUBLISH_PERIOD_H = 12
@@ -142,14 +147,33 @@ def _set_output(name, value):
 def resolve_budget(n):
     """HEARTBEAT_BUDGET=auto 时按「confirm 轮确认要落在发布周期内」反推每轮预算。
 
-    固定值 12 只在 N 小的时候成立; 写死一个大值又会在 N 小的时候白烧请求,
-    所以让预算跟着 N 走, 并给出上下限 (下限保证小站点也够用, 上限保证不会把额度打爆)。
+    优先「一轮全测」: 当 n <= CEIL 时直接测完所有节点, 确认窗口 = confirm 小时。
+    这不是为了省事, 是因为分批会让窗口成倍变长 —— N=17 时 ceil(17/12)*2 = 4h,
+    一轮全测后只要 2h, 而这正是心跳存在的意义 (把发现死节点的时间压到最短)。
+
+    n > CEIL 时才退回分批: 按 ceil(n / (PUBLISH_PERIOD_H / confirm)) 反推, 保证
+    ceil(n/budget)*confirm <= PUBLISH_PERIOD_H。上限 CEIL 是请求量闸门 —— 它同时意味着
+    N > CEIL*PUBLISH_PERIOD_H/confirm (= 288, 默认值下) 时 auto 也无法保证时效,
+    那时只剩 scale_warning 起作用, 不能假装 auto 永远有效。
     """
     if not HEARTBEAT_BUDGET_AUTO:
         return HEARTBEAT_BUDGET
+    if n <= HEARTBEAT_BUDGET_CEIL:
+        return max(HEARTBEAT_BUDGET_FLOOR, n)
     per_round_hours = max(1, PUBLISH_PERIOD_H // max(1, HEARTBEAT_CONFIRM))
     need = int(math.ceil(n / float(per_round_hours)))
     return max(HEARTBEAT_BUDGET_FLOOR, min(HEARTBEAT_BUDGET_CEIL, need))
+
+
+def resolve_history_max(per_round):
+    """时序记录的保留行数。auto = 每轮行数 x 24 轮/天 x 天数, 且不低于 FLOOR。
+
+    固定 4000 行只在 N 很小的时候够两周; 一旦一轮全测 48 个节点, 4000 行只剩 3.5 天,
+    两周后回头看只剩最近三四天的数据, 「按历史存活率排序」就没有历史可用了。
+    """
+    if not HEARTBEAT_HISTORY_AUTO:
+        return HEARTBEAT_HISTORY_MAX
+    return max(HEARTBEAT_HISTORY_FLOOR, per_round * 24 * HEARTBEAT_HISTORY_DAYS)
 
 
 def scale_warning(n, budget):
@@ -432,22 +456,27 @@ def history_lines(items, results, pruned, ts):
 
 
 def write_history(session, new_lines):
-    """追加到 JSONL 并保留最后 HEARTBEAT_HISTORY_MAX 行。
+    """追加到 JSONL 并保留最近 resolve_history_max() 行。
 
-    历史读不到 (404) 从空开始; 读失败 (5xx/超时) 则**整轮不写** ——
-    用空历史覆盖线上, 等于把攒了几周的数据一次删光, 比少记一轮严重得多。
+    两种「读不到」必须分开, 因为它们该触发完全相反的动作:
+      * 404 (从没跑过 / 首轮): 从空开始, 正常追加。
+      * 5xx/超时 (文件在线上, 这一瞬间没拿到): **本轮不追加**。用空历史覆盖线上,
+        等于把攒了几周的数据一次删光, 比少记一轮严重得多。
+    注意「不追加」只影响这个文件: 判定、摘除、heartbeat.json 全都照常 ——
+    时序记录是可观测性的副产品, 不能反过来阻塞主判定。
     """
-    if HEARTBEAT_HISTORY_MAX <= 0 or not new_lines:
+    keep = resolve_history_max(len(new_lines))
+    if keep <= 0 or not new_lines:
         return None
     state, value = fetch_probe(session, f"{_BASE}/{HISTORY_NAME}", "线上历史记录")
     if state == "error":
-        vg.warn(f"历史记录读取失败 ({value}) — 本轮不追加, 避免覆盖已攒下的数据")
+        vg.warn(f"历史记录读取失败 ({value}) — 本轮只跳过追加, 判定与摘除照常")
         return None
     old = [ln for ln in (value or "").splitlines() if ln.strip()] if state == "ok" else []
-    merged = (old + new_lines)[-HEARTBEAT_HISTORY_MAX:]
+    merged = (old + new_lines)[-keep:]
     with open(os.path.join(vg.PUBLIC_DIR, HISTORY_NAME), "w", encoding="utf-8") as f:
         f.write("\n".join(merged) + "\n")
-    vg.log("HEARTBEAT", f"历史记录 {len(old)} -> {len(merged)} 行 ({HISTORY_NAME})")
+    vg.log("HEARTBEAT", f"历史记录 {len(old)} -> {len(merged)} 行 (上限 {keep}, {HISTORY_NAME})")
     return len(merged)
 
 
@@ -461,11 +490,22 @@ def _status_of(exc):
     也就是说 404 永远走不到 `r.status_code` 那个分支。要区分「文件不存在」和「这次没读到」,
     只能从异常里把状态码取回来 —— 否则一个首次部署还没生成 endpoints.json 的站点,
     会被判成「读取失败」而永久跳过部署。
+
+    三级取值, 都不猜:
+      1. exc.status_code —— 自定义异常带的话直接用。
+      2. exc.response.status_code —— requests.HTTPError (408/429 重试耗尽时抛的那个)
+         只挂 response, 没有 status_code; 少了这一步就只能靠正则去啃字符串。
+      3. `\bHTTP[ /](\\d{3})\\b` —— vg 自己的文案是 "HTTP 404 (不重试)" / "HTTP 502",
+         加词边界避免把 "...HTTP 5020..." 这类无关数字当成状态码。
+    取不到就返回 None, 由调用方按「读失败」处理 (保守方向, 不会误删线上文件)。
     """
     code = getattr(exc, "status_code", None)
+    if not isinstance(code, int):
+        resp = getattr(exc, "response", None)
+        code = getattr(resp, "status_code", None)
     if isinstance(code, int):
         return code
-    m = re.search(r"HTTP[ /](\d{3})", str(exc))
+    m = re.search(r"\bHTTP[ /](\d{3})\b", str(exc))
     return int(m.group(1)) if m else None
 
 
@@ -502,10 +542,25 @@ def fetch_text(session, url, what):
     return value
 
 
-def load_prev_heartbeat(session):
-    """上一轮 heartbeat.json: 死链计数必须跨轮累积, 不能存在本地 (Actions 每次都是干净目录)。"""
-    text = fetch_text(session, vg.NODES_URL.rsplit("/", 1)[0] + "/" + HEARTBEAT_NAME, "上一轮 heartbeat.json")
-    if not text:
+def load_prev_heartbeat(session, published=0):
+    """上一轮 heartbeat.json: 死链计数必须跨轮累积, 不能存在本地 (Actions 每次都是干净目录)。
+
+    线上「没有 heartbeat.json」有两种原因, 后果完全不同:
+      * 首轮: 正常, 从空状态开始。
+      * 状态被清掉: check.yml 的 Preserve 步骤失败 (或人为清理)。此时 streak 归零,
+        连判过一轮的节点要重新攒够 confirm 轮 —— 功能静默退化, 而表面上一切正常。
+    单看这一个文件无法区分两者 (没有第三方状态可对照), 所以只能在「明明有已发布节点、
+    却读不到状态」时喊一声, 让日志里至少留下痕迹。
+    """
+    state, text = fetch_probe(session, vg.NODES_URL.rsplit("/", 1)[0] + "/" + HEARTBEAT_NAME,
+                              "上一轮 heartbeat.json")
+    if state == "missing":
+        if published > 0:
+            vg.warn(f"线上有 {published} 个已发布节点, 却读不到 heartbeat.json — "
+                    f"首轮, 或状态被上一次 check 部署清掉了 (死链证据从零重攒, 本轮不会摘任何节点)")
+        return {}
+    if state == "error":
+        vg.warn(f"读取 heartbeat.json 失败 ({text}) — 本轮按无历史处理, 已攒的死链证据这轮用不上")
         return {}
     try:
         return json.loads(text)
@@ -625,7 +680,7 @@ def main():
         _set_output("escalate", "false")
         return 1
 
-    prev = load_prev_heartbeat(session)
+    prev = load_prev_heartbeat(session, len(items))
     prev_streak = prev.get("dead_streak") or {}
     prev_escalate = int(prev.get("escalate_streak") or 0)
     cursor = int(prev.get("cursor") or 0)

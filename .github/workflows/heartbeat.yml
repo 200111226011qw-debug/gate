@@ -64,8 +64,11 @@ jobs:
           HEARTBEAT_MAX_DEAD_RATIO: "0.5"
           # 连续触发几次完整重跑后进入冷却 (只记录不重跑), 避免每小时烧一遍上百请求
           HEARTBEAT_ESCALATE_MAX: "2"
-          # 时序记录: 每行一个节点, 保留最近 4000 行 (约 2 周)。攒够就能按历史存活率排序。
-          HEARTBEAT_HISTORY_MAX: "4000"
+          # 时序记录: 每行一个被测节点。保留行数跟随 N 走 (auto = 每轮行数 x 24 x 天数,
+          # 不低于 4000) —— 写死 4000 在「一轮全测 48 个」时只够 3.5 天, 攒不出可用的历史。
+          # 0 = 关闭。
+          HEARTBEAT_HISTORY_MAX: "auto"
+          HEARTBEAT_HISTORY_DAYS: "7"
         run: |
           set +e
           python heartbeat.py

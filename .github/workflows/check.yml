@@ -126,19 +126,38 @@ jobs:
       # **整站替换**: public/ 里没有的文件, 部署完就从线上消失了。不在这里把它们搬回来,
       # 每次 check 发布都会把心跳的证据清零 —— 「连续 2 轮确认才摘」在节点数稍大时
       # (覆盖一轮超过 6 小时) 就永远凑不齐, 表现为心跳每小时都在跑、从来不摘任何节点。
+      #
+      # 位置有硬约束: 必须在 `python vpngate.py` 之后 (public/ 里才有本轮产物、才能被整站上传),
+      # 且在 Upload Pages artifact 之前 (补进来的文件才进部署包)。放到 vpngate.py 之前没有意义。
       - name: Preserve heartbeat state
         run: |
           mkdir -p public
           base="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
           for f in heartbeat.json heartbeat-history.jsonl; do
-            if curl -fsSL --retry 2 --retry-delay 2 --max-time 20 \
-              -o "public/$f" "$base/$f?t=$(date +%s)"; then
-              echo "已保留 $f ($(wc -c < "public/$f") bytes)"
-            else
-              # 取不到就删掉半截文件: 宁可让心跳从空状态重新积累, 也不要发布一个损坏的 JSON
-              rm -f "public/$f"
-              echo "线上暂无 $f (首轮 / 从未跑过心跳), 跳过"
-            fi
+            code=$(curl -sSL --retry 2 --retry-delay 2 --max-time 20 \
+              -o "public/$f" -w '%{http_code}' "$base/$f?t=$(date +%s)" 2>/dev/null || true)
+            code="${code:-000}"
+            case "$code" in
+              200)
+                if [ -s "public/$f" ]; then
+                  echo "已保留 $f ($(wc -c < "public/$f") bytes)"
+                else
+                  rm -f "public/$f"
+                  echo "::warning::$f 返回 200 但内容为空 — 本轮心跳状态将重新累积"
+                fi
+                ;;
+              404|410)
+                # 真的没有这个文件 (首轮 / 从未跑过心跳): 正常跳过, 不该报警
+                rm -f "public/$f"
+                echo "线上暂无 $f (首轮 / 从未跑过心跳), 跳过"
+                ;;
+              *)
+                # 读失败 ≠ 不存在。静默跳过的后果是证据每 12 小时归零一次,
+                # 而 check 的日志全绿、心跳也在跑 —— 没人会发现它在空转。
+                rm -f "public/$f"
+                echo "::warning::保留 $f 失败 (HTTP $code) — 本轮心跳死链证据将丢失并重新累积"
+                ;;
+            esac
           done
 
       - name: Configure Pages

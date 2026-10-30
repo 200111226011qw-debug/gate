@@ -219,20 +219,30 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 
 ### 规模假设（先看这一条，再决定要不要开）
 
-每轮复检 `HEARTBEAT_BUDGET` 个节点，所以「覆盖一整张表」要 `ceil(N/budget)` 轮，
-「同一节点凑够 `confirm` 次确认」要 `ceil(N/budget) × confirm` 小时。它必须小于 12 小时发布周期：
+`auto` 预算优先「**一轮全测**」：`N ≤ HEARTBEAT_BUDGET_CEIL`（默认 48）时每轮测完所有节点，
+确认窗口就是 `confirm` 小时。分批是有代价的 —— 同样是 N=17，`budget=12` 时
+`ceil(17/12) × 2 = 4h` 才凑够确认，一轮全测只要 2h，而「窗口短」正是心跳存在的全部意义。
 
-| N（线上节点数） | 覆盖一轮 | 2 轮确认 | 结论 |
-| ---: | ---: | ---: | :--- |
-| 17 | 1.4h | 2.9h | 余量充足 |
-| 100 | 8.3h | 16.7h | 超出周期，需 budget ≥ 17 |
-| 200 | 16.7h | 33.3h | 超出周期，需 budget ≥ 34 |
+`N > 48` 才退回分批，按 `ceil(N / (12/confirm))` 反推，保证 `ceil(N/budget) × confirm ≤ 12`：
+
+| N（线上节点数） | auto 取值 | 覆盖一轮 | 2 轮确认 | 结论 |
+| ---: | ---: | ---: | ---: | :--- |
+| 17 | 17（全测） | 1h | 2h | 一轮测完 |
+| 48 | 48（全测） | 1h | 2h | 一轮测完 |
+| 100 | 17 | 6h | 12h | 刚好压进发布周期 |
+| 200 | 34 | 6h | 12h | 刚好压进发布周期 |
+| **288** | 48 | 6h | 12h | **auto 的硬边界** |
+| 4000 | 48 | 84h | 168h | 无解，只剩 `scale_warning` |
+
+**288 不是估值，是算出来的硬边界**：`CEIL × 12 / confirm = 48 × 12 / 2`。超过它，`auto` 也凑不齐
+12 小时窗口 —— 别把 `auto` 当成「永远有效」。到了那一步只有三条路：调小 `HEARTBEAT_CONFIRM`
+（用更少的确认换时效）、调大 `CEIL`（用更多请求换覆盖）、或者接受「心跳只测不摘，摘除交给 12 小时
+主流程」。`test_auto_has_a_hard_validity_ceiling_at_288` 把这个数字钉在测试里，改 `CEIL` 或
+`CONFIRM` 时会立刻失败 —— 否则「auto 就没事了」会变成一句静默的错误。
 
 超出的**症状不是报错，而是「每小时都在跑、从来不摘」**：证据还没攒够，`check.yml` 就发布了新产物，
-把 `heartbeat.json` 换掉了。所以：
-
-- 预算默认写 `auto`：`ceil(N / (12/confirm))`，下限 12、上限 48（`HEARTBEAT_BUDGET_FLOOR/CEIL`）；
-- 用固定值且超出时，`heartbeat.json` 会带 `scale_warning` 并打 `::warning::`，别忽略它。
+把 `heartbeat.json` 换掉了。按固定值配置且超出时，`heartbeat.json` 会带 `scale_warning` 并打
+`::warning::`，别忽略它。
 
 ### 状态为什么会丢（以及怎么不丢）
 
@@ -255,8 +265,14 @@ Pages 部署是**整站替换**：谁部署，站点上就只剩谁的 `public/`
 
 `3` 是**在同一份 workflow 里**跑 `python vpngate.py`，不用 `workflow_dispatch`（那需要
 `actions: write`，容易踩 403），也不靠空 commit 触发。连续 `HEARTBEAT_ESCALATE_MAX`（默认 2）次
-之后进入 `escalate_cooldown`：只记录不重跑，把长期大面积失效交回给 12 小时主流程 ——
-否则一批长期死透的节点会让每小时都烧一遍上百个请求。
+之后进入 `escalate_cooldown`，把长期大面积失效交回给 12 小时主流程 —— 否则一批长期死透的节点会让
+每小时都烧一遍上百个请求。
+
+**冷却期间仍然检测。** 冷却的目的是「别再每小时跑一遍完整流水线」，不是「别再看了」：`cooldown`
+只关掉重跑那一步，采样、判定、写 `heartbeat.json` / 时序记录照常。代价是每小时十几次 Worker
+请求（相对完整流水线的上百次可以忽略），换来的是冷却结束时立刻知道当前状态，而不是两眼一黑。
+注意 `escalate` 分支本身是**不摘任何节点**的（`decide()` 在 `ratio > max_dead_ratio` 时返回空的
+`prune`）—— 大面积失效要靠重新抓源，不是就地砍订阅。
 
 ### 「线上没有」和「这次没读到」不是一回事
 
@@ -265,16 +281,45 @@ Pages 部署是**整站替换**：谁部署，站点上就只剩谁的 `public/`
 - `404/410` → **缺失**，允许继续（首次部署还没生成 `endpoints.json` 就是这种）；
 - `5xx/超时/200+空 body` → **读取失败**，本轮**不部署**（退出码 4）。整站替换下，漏镜像一个文件
   等于主动把它从线上删掉，一次网络抖动换一个线上故障不划算。
+- `403/401/429` 也归**读取失败**，不是缺失。它们说的是「这个文件存在但你这次拿不到」
+  （权限/限流），按缺失处理就会在部署时把它删掉。只有 `404/410` 代表「它本来就不在」。
 
 `index.html` 是唯一允许兜底的：确实 404 就用仓库模板 `render_html()` 生成；读取失败则仍然中止，
 因为兜底会把线上页面换成旧模板。
 
+状态码是从异常里取的，因为 `vg._http_get` 对 4xx 是**抛 `_NoRetryHTTPError`**（而不是返回
+`resp.status_code`），`r.status_code == 404` 那个分支永远走不到。取值顺序：`exc.status_code` →
+`exc.response.status_code`（`requests.HTTPError` 只挂 `response`，408/429 重试耗尽时就是它）→
+从消息里用 `\bHTTP[ /](\d{3})\b` 抠。三级都取不到就按读失败处理 —— 保守方向不会误删线上文件。
+
 ### 时序记录（`heartbeat-history.jsonl`）
 
-每轮每个被测节点追加一行 `{t,h,p,ok,kind,ms,act}`，保留最近 `HEARTBEAT_HISTORY_MAX` 行（默认 4000，
-约两周）。它是「按历史存活率排序」替代「按本轮延迟排序」唯一缺的数据，而数据本身是检测的副产品。
-读不到旧文件（404）就从空开始；**读失败（5xx）则整轮不写** —— 用空历史覆盖线上等于把攒了几周的
-数据一次删光。设 `HEARTBEAT_HISTORY_MAX=0` 可关闭。
+每轮每个被测节点追加一行 `{t,h,p,ok,kind,ms,act}`，超过上限只保留最近若干行。它是「按历史存活率
+排序」替代「按本轮延迟排序」唯一缺的数据，而数据本身是检测的副产品。
+
+**上限默认是 `auto`，不是固定 4000。** 固定行数是个陷阱：4000 行在 N=17、每轮 12 行时够两周，
+在一轮全测 48 个时只够 3.5 天 —— 「保留约两周」这句话必须由 N 决定。`auto` 按
+`每轮行数 × 24 × HEARTBEAT_HISTORY_DAYS`（默认 7 天）算，且不低于 `HEARTBEAT_HISTORY_FLOOR`（4000）。
+设 `HEARTBEAT_HISTORY_MAX=0` 关闭。
+
+两种「读不到旧文件」必须分开，因为它们该触发相反的动作：
+
+- `404`（从没跑过 / 首轮）→ 从空开始，正常追加；
+- `5xx`/超时 → **本轮跳过追加**。用空历史覆盖线上等于把攒了几周的数据一次删光，比少记一轮严重得多。
+
+**「跳过追加」只影响这个文件**：判定、摘除、`heartbeat.json` 全都照常。时序记录是可观测性的副产品，
+不能反过来阻塞主判定 —— 那是把辅助数据当成了主链路。
+
+### 状态丢了怎么办
+
+线上「没有 `heartbeat.json`」有两种原因，后果完全不同：首轮（正常）与状态被删（`Preserve` 步骤失败 /
+人为清理）。后者会让 `streak` 归零，连判过一轮的节点要重新攒够 `confirm` 轮 —— **功能静默退化，而表面
+上一切正常**。单看一个文件无法区分，所以：
+
+- `load_prev_heartbeat()` 在「有已发布节点却读不到状态」时打一条明确告警，让日志里至少留痕；
+- `check.yml` 的 `Preserve` 步骤区分 `404/410`（真没有，正常跳过）与其它状态码（读失败，
+  打 `::warning::`）。静默跳过是这套机制里最危险的失败方式 —— check 日志全绿、心跳也在跑，
+  而证据每 12 小时被抹一次。
 
 ### 与其它机制的关系
 
@@ -295,8 +340,10 @@ Pages 部署是**整站替换**：谁部署，站点上就只剩谁的 `public/`
 | `HEARTBEAT_CONFIRM` | `2` | 连续 N 轮确认才摘除 |
 | `HEARTBEAT_MIN_ALIVE` | `MIN_SUCCESS` | 摘除后剩余下限，低于此值不动手 |
 | `HEARTBEAT_MAX_DEAD_RATIO` | `0.5` | 单轮确认不通占比超过该值 → 升级为完整重跑 |
-| `HEARTBEAT_ESCALATE_MAX` | `2` | 连续触发几次完整重跑后进入冷却 |
-| `HEARTBEAT_HISTORY_MAX` | `4000` | 时序记录保留行数，`0` 关闭 |
+| `HEARTBEAT_ESCALATE_MAX` | `2` | 连续触发几次完整重跑后进入冷却（冷却期间仍检测，只是不重跑） |
+| `HEARTBEAT_HISTORY_MAX` | `auto` | 时序记录保留行数；`auto` = 每轮行数 × 24 × 天数，`0` 关闭 |
+| `HEARTBEAT_HISTORY_DAYS` | `7` | `auto` 的目标保留天数 |
+| `HEARTBEAT_HISTORY_FLOOR` | `4000` | `auto` 的行数下限（小站点不会少于这个） |
 
 另外两点值得知道：
 
@@ -496,6 +543,7 @@ PYTHONPATH=tests python -m unittest discover -s tests -p "test_heartbeat*.py" -v
 
 | 日期 | 版本 | 变更 |
 | :--- | :--- | :--- |
+| 2026-10-30 | v1.7.2 | **规模与失败可见性收口**（二轮评审）：① `auto` 预算改为优先「一轮全测」—— `N ≤ CEIL` 时每轮测完全部节点，确认窗口 = `confirm` 小时（N=17 从 4h 缩到 2h），`N > CEIL` 才分批；② 把 `auto` 的**硬边界 288**（`CEIL × 12 / confirm`）写进 README 并用 `test_auto_has_a_hard_validity_ceiling_at_288` 钉住，避免「auto 永远有效」的误读；③ `check.yml` 的 `Preserve heartbeat state` 区分 `404/410`（真没有，静默）与其它码（读失败，`::warning::`），并注释了「必须在 `vpngate.py` 之后、`Upload Pages artifact` 之前」的顺序约束；④ `load_prev_heartbeat()` 在「有已发布节点却读不到状态」时告警 —— 状态被清空会让 `streak` 归零、功能静默退化，而表面上一切正常；⑤ 时序记录上限改 `auto`（每轮行数 × 24 × 天数，下限 4000）：固定 4000 在「一轮全测 48 个」时只够 3.5 天，「保留约两周」必须由 N 决定；⑥ `_status_of` 补 `exc.response.status_code` 一级并加词边界（`requests.HTTPError` 只挂 `response`），`403/401/429` 明确归「读失败」而非「缺失」；⑦ README 写明 `escalate_cooldown` 期间**仍然检测**，只关掉重跑。测试 54 → 68（新增 288 边界、一轮全测、403/401/429 归因、状态码三级取值、行数上限换算、状态缺失告警与其静默边界） |
 | 2026-10-30 | v1.7.1 | **心跳的规模与状态修正**（评审 P0/P1）：① `check.yml` 新增 `Preserve heartbeat state` —— Pages 是整站替换，原先每次 check 发布都会把 `heartbeat.json` 连同死链证据一起清掉，`confirm=2` 在 `ceil(N/budget) > 6` 时永远凑不齐（症状是「每小时都在跑、从来不摘」）；② 预算支持 `HEARTBEAT_BUDGET=auto`，按 `ceil(N/(12/confirm))` 反推（下限 12 / 上限 48），超出发布周期时写 `scale_warning` 并告警；③ 退出码 `4` 区分「线上没有这个文件」(404，允许继续) 与「这次没读到」(5xx/超时/200+空 body，禁止部署) —— `vg._http_get` 对 4xx 是抛 `_NoRetryHTTPError`，404 判断必须从异常里取状态码才生效（冒烟抓到）；④ 连续 `HEARTBEAT_ESCALATE_MAX` 次完整重跑后进入 `escalate_cooldown`，不再每小时烧一遍上百请求；⑤ 新增 `heartbeat-history.jsonl` 时序记录（每轮每节点一行，默认保留 4000 行，读失败则整轮不写，避免覆盖已攒数据）；⑥ `heartbeat.json` 增加 `untested_ratio` / `escalate_streak` / `staging_missing` / `staging_errors` / `budget_auto`。测试 30 → 54 个（新增镜像失败分支、预算伸缩、升级冷却、时序裁剪与「常量与使用点形状」结构断言） |
 | 2026-10-30 | v1.7.0 | **新增发布后心跳**（`heartbeat.py` + `heartbeat.yml`）：每小时复检线上 `nodes.txt`，把连续 `HEARTBEAT_CONFIRM` 轮确认不通的节点摘掉并重发，把「发布后 12 小时空窗」压到 1 小时。三条硬约束：只摘 `failure_kind=node_dead`（`target_ratelimit`/`worker_error` 一律保留，未测不等于不通）、证据跨轮累积且当轮必须仍是 `node_dead`（旧证据不能支撑摘除动作）、摘后低于 `HEARTBEAT_MIN_ALIVE` 或单轮死亡占比超 `HEARTBEAT_MAX_DEAD_RATIO` 则改用退出码 3 触发完整重跑。复用 `vpngate.check_one`/`PortCircuitBreaker`/`AdaptiveLimiter`，归因与熔断口径零分叉；部署前先镜像线上整站产物（Pages 部署是整站替换，漏镜像会把 `index.html`/`check-worker.js` 从线上删掉）；`data.json` 同步裁剪且 `raw_nodes`/`checked` 等「那一轮」字段保持原值，心跳结论独立写 `heartbeat.json`，不改 `status.json`。新增 30 个离线用例（`test_heartbeat.py` 判定边界 + `test_heartbeat_flow.py` 全流程落盘） |
 | 2026-10-24 | v1.6.4 | **复查完善**：`_http_get` 对 4xx（非 408/429）不再重试（URL 写错/鉴权失败重试无意义，与 `check_one` 口径一致）；`filter_edge_hosts` 新增第 0 步——入口去重 + IPv6 字面量明确剔除并告警（此前 IPv6 条目会被 DNS 检测误报「无 A 记录」，`EDGE_DNS_CHECK=0` 时更会流进产物导致发布前自检整轮拒发；节点行格式仅支持域名/IPv4，README 已声明）；`parse_mirror_json` 的 `country_short` 不再用国家全名兜底（避免 `countries.code` 出现 "Japan" 类非 2 位码，展示层回退 `country_long`）；`data.json` stats 新增 `carried_over`（MERGE 模式下区分「本轮实测」与「携带合并」）；workflow 开启 Pages 步骤增加返回码检查，失败时打明确告警并指引手动开启，查询返回 403 时同样告警（注：GITHUB_TOKEN 无 `administration` 权限键可用，该建议不可行）；`Show site URL` 改为按仓库动态拼接（fork/改名后自动正确）；`HOSTS_ENTRY` 显式路径共用同一道「去重+IPv6 剔除」清理（`_drop_unsupported_entries`），人工指定仍优先于黑名单/DNS 检测，`build_nodes_text` 的回退分支同样过清理（入口池全为不支持的格式时准确降级为「入口池配置异常」，而非误导性的「节点行格式自检未通过」），清理告警按「IPv6 条目 / 含冒号脏条目」分类；测试新增 `mirror_404` 场景与 `filter_edge_hosts` 单元断言 |
