@@ -122,6 +122,25 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # 心跳状态 (死链证据 / 采样游标 / 时序记录) 不是 vpngate.py 的产物, 而 Pages 部署是
+      # **整站替换**: public/ 里没有的文件, 部署完就从线上消失了。不在这里把它们搬回来,
+      # 每次 check 发布都会把心跳的证据清零 —— 「连续 2 轮确认才摘」在节点数稍大时
+      # (覆盖一轮超过 6 小时) 就永远凑不齐, 表现为心跳每小时都在跑、从来不摘任何节点。
+      - name: Preserve heartbeat state
+        run: |
+          mkdir -p public
+          base="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}"
+          for f in heartbeat.json heartbeat-history.jsonl; do
+            if curl -fsSL --retry 2 --retry-delay 2 --max-time 20 \
+              -o "public/$f" "$base/$f?t=$(date +%s)"; then
+              echo "已保留 $f ($(wc -c < "public/$f") bytes)"
+            else
+              # 取不到就删掉半截文件: 宁可让心跳从空状态重新积累, 也不要发布一个损坏的 JSON
+              rm -f "public/$f"
+              echo "线上暂无 $f (首轮 / 从未跑过心跳), 跳过"
+            fi
+          done
+
       - name: Configure Pages
         uses: actions/configure-pages@v6
         with:

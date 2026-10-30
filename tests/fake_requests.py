@@ -250,7 +250,23 @@ class Session:
             _log(f"lastgood-data:{mode}")
             if mode == "missing":
                 return _Response(404, "Not Found")
-            return _Response(200, payload=LAST_GOOD_DATA)
+            return _Response(200, json.dumps(LAST_GOOD_DATA), payload=LAST_GOOD_DATA)
+        if url.split("?")[0].endswith(("index.html", "status.json", "check-worker.js", "endpoints.json")):
+            # 心跳做整站镜像时会逐个读这些文件; 让替身能返回它们, 才能端到端跑通镜像路径。
+            mode = os.environ.get("FAKE_SITE", "present")
+            _log(f"site:{mode}")
+            if mode == "missing":
+                return _Response(404, "Not Found")
+            if mode == "flaky":
+                return _Response(503, "Service Unavailable")
+            return _Response(200, "<html>fake site</html>" if url.split("?")[0].endswith("index.html") else "{}")
+        if url.split("?")[0].endswith(("heartbeat.json", "heartbeat-history.jsonl")):
+            # 心跳状态: 默认线上没有 (首轮语义); 用 FAKE_HB_JSON / FAKE_HB_HISTORY 注入已有状态
+            raw = os.environ.get("FAKE_HB_JSON" if url.split("?")[0].endswith("heartbeat.json")
+                                 else "FAKE_HB_HISTORY")
+            if not raw:
+                return _Response(404, "Not Found")
+            return _Response(200, raw)
         raise FakeError(f"fake: 未处理的 URL {url}")
 
 

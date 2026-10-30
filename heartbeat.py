@@ -39,14 +39,35 @@
   0 = 正常 (可能没有任何改动, 见 heartbeat.json.changed)
   1 = 拿不到线上 nodes.txt, 什么也没做 (调用方不应部署)
   3 = 建议升级为完整重跑 (样本死亡比例过高, 疑似大面积失效或检测端异常)
+  4 = 站点镜像遇到临时故障 (503/超时等), 本轮不部署 —— 部署会删掉没镜像到的文件
+
+规模假设 (必读)
+---------------
+每轮复检 HEARTBEAT_BUDGET 个节点, 所以「覆盖一整张节点表」需要 ceil(N/budget) 轮,
+「同一节点拿到 confirm 次确认」需要 ceil(N/budget)*confirm 小时。要让它落在 12 小时的
+发布周期内 (否则 check.yml 的整站部署会先把证据清掉, 见下), 就必须:
+    ceil(N/budget) * confirm <= 12
+  N=17  budget=12 confirm=2  ->  1*2 = 2h     ✓
+  N=100 budget=12 confirm=2  ->  9*2 = 18h    ✗ (需要 budget>=17)
+  N=200 budget=12 confirm=2  -> 17*2 = 34h    ✗ (需要 budget>=34)
+budget 写 "auto" 时按上式自动取值 (下限 12, 上限 48)。超出时会在 heartbeat.json 里写
+scale_warning 并打 ::warning:: —— 那时功能会退化成「只测不摘」, 不能假装看不见。
+
+状态为什么要跨发布保留
+---------------------
+Pages 部署是整站替换: 谁部署, 站点上就只剩谁的 public/。check.yml 的产物里没有
+heartbeat.json, 所以它在部署完的瞬间会把死链证据清零。check.yml 里那一步
+"Preserve heartbeat state" 就是为此存在的 —— 没有它, confirm=2 在 N 稍大时永远凑不齐。
 """
 
 import os
 import sys
+import math
 import time
 import json
 import random
 import traceback
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
@@ -76,16 +97,30 @@ def _env_int(name, default, minimum=0):
         return default
 
 
-HEARTBEAT_BUDGET = _env_int("HEARTBEAT_BUDGET", 12, 1)          # 单轮最多复检多少个节点
+_BUDGET_RAW = (os.environ.get("HEARTBEAT_BUDGET") or "").strip()
+HEARTBEAT_BUDGET_AUTO = _BUDGET_RAW.lower() == "auto"
+HEARTBEAT_BUDGET = 12 if HEARTBEAT_BUDGET_AUTO else _env_int("HEARTBEAT_BUDGET", 12, 1)  # 单轮最多复检多少个节点
+HEARTBEAT_BUDGET_FLOOR = _env_int("HEARTBEAT_BUDGET_FLOOR", 12, 1)
+HEARTBEAT_BUDGET_CEIL = _env_int("HEARTBEAT_BUDGET_CEIL", 48, 1)
 HEARTBEAT_CONCURRENCY = _env_int("HEARTBEAT_CONCURRENCY", 2, 1)  # 并发必须低于主流程: 这是在已发布产物上做增量探测
 HEARTBEAT_TIMEOUT = float(os.environ.get("HEARTBEAT_TIMEOUT", "30") or 30)
 HEARTBEAT_CONFIRM = _env_int("HEARTBEAT_CONFIRM", 2, 1)         # 连续 N 轮判死才摘
 HEARTBEAT_MIN_ALIVE = _env_int("HEARTBEAT_MIN_ALIVE", vg.MIN_SUCCESS, 1)
 HEARTBEAT_MAX_DEAD_RATIO = float(os.environ.get("HEARTBEAT_MAX_DEAD_RATIO", "0.5") or 0.5)
+# 连续触发完整重跑的轮数上限: 超过后只记录不重跑, 把修复交回给 12 小时的 check.yml。
+# 没有这道闸, 一批长期死透的节点会让每小时都跑一遍上百请求的完整流水线。
+HEARTBEAT_ESCALATE_MAX = _env_int("HEARTBEAT_ESCALATE_MAX", 2, 0)
+# 单轮检测结果的时序记录 (JSONL): 0 = 关闭。每行一个节点, 用来把「按本轮延迟排序」
+# 换成「按历史存活率排序」; 攒数据本身零成本, 缺的是时间。
+HEARTBEAT_HISTORY_MAX = _env_int("HEARTBEAT_HISTORY_MAX", 4000, 0)
+
+# 发布周期 (小时): check.yml 的 cron 是 */12。只用于规模自检, 不影响调度。
+PUBLISH_PERIOD_H = 12
 
 NODES_FILENAME = "nodes.txt"
 DATA_FILENAME = "data.json"
 HEARTBEAT_NAME = "heartbeat.json"
+HISTORY_NAME = "heartbeat-history.jsonl"
 
 # 心跳把超时压低: 它跑在定时任务里, 一轮拖过 10 分钟就有可能和下一轮重叠。
 # 直接改模块级变量是因为 check_one 内部读的就是这个全局值 (见 check_one 的 session.get)。
@@ -102,6 +137,34 @@ def _set_output(name, value):
             f.write(f"{name}={value}\n")
     except OSError:
         pass
+
+
+def resolve_budget(n):
+    """HEARTBEAT_BUDGET=auto 时按「confirm 轮确认要落在发布周期内」反推每轮预算。
+
+    固定值 12 只在 N 小的时候成立; 写死一个大值又会在 N 小的时候白烧请求,
+    所以让预算跟着 N 走, 并给出上下限 (下限保证小站点也够用, 上限保证不会把额度打爆)。
+    """
+    if not HEARTBEAT_BUDGET_AUTO:
+        return HEARTBEAT_BUDGET
+    per_round_hours = max(1, PUBLISH_PERIOD_H // max(1, HEARTBEAT_CONFIRM))
+    need = int(math.ceil(n / float(per_round_hours)))
+    return max(HEARTBEAT_BUDGET_FLOOR, min(HEARTBEAT_BUDGET_CEIL, need))
+
+
+def scale_warning(n, budget):
+    """N 太大时必须主动喊出来。
+
+    否则故障表现是「每小时都在跑、从来不摘任何节点」—— 最容易被误读成「节点都很健康」。
+    """
+    rounds = int(math.ceil(n / float(max(1, budget))))
+    window = rounds * HEARTBEAT_CONFIRM
+    if window <= PUBLISH_PERIOD_H:
+        return None
+    need = int(math.ceil(n * HEARTBEAT_CONFIRM / float(PUBLISH_PERIOD_H)))
+    return (f"{n} 个节点 / 每轮 {budget} 个 -> 覆盖一轮 {rounds}h, 连续 {HEARTBEAT_CONFIRM} 轮确认要 {window}h "
+            f"> 发布周期 {PUBLISH_PERIOD_H}h: 死链证据会随 check 部署失效, 实际退化成「只测不摘」。"
+            f"调法: HEARTBEAT_BUDGET=auto, 或把预算提到 >= {need}")
 
 
 # ---------------------------------------------------------------------------
@@ -328,33 +391,115 @@ def prune_data_json(data, prune):
     if isinstance(stats, dict):
         stats = dict(stats)
         total = sum(g["count"] for g in countries.values())
+        # countries / success / residential_est / datacenter_est 描述**当前状态**: 与 available 同步裁剪,
+        # 否则面板会说「日本 5 个」而 available 里只剩 4 个。
         stats["countries"] = len(countries)
         stats["success"] = total
         stats["residential_est"] = sum(g["residential"] for g in countries.values())
         stats["datacenter_est"] = sum(g["datacenter"] for g in countries.values())
+        # failed 保持「checked - 当前可用」: checked 是那一轮的历史, success 是当前,
+        # 两者相减的语义是「检查过但现在用不了」(含被心跳摘掉的), 面板上仍能自洽。
+        # raw_nodes / sstp_nodes / checked / carried_over 一律不动 —— 它们是那一轮的快照。
         stats["failed"] = max(0, int(stats.get("checked") or 0) - total)
         data["stats"] = stats
     return data
 
 
 # ---------------------------------------------------------------------------
+# 时序记录: 每轮检测结果追加一行 JSONL
+# ---------------------------------------------------------------------------
+def history_lines(items, results, pruned, ts):
+    """把本轮每个被测节点摊成一行。
+
+    这是「按历史存活率排序」唯一缺的东西 —— 数据本身是检测的副产品, 攒的是时间。
+    字段刻意用短名: 这个文件会长期增长 (默认上限 4000 行), 每行多 20 字节就是 80KB。
+    """
+    out = []
+    for item in items:
+        r = results.get((item["host"], item["port"]))
+        if r is None:
+            continue
+        out.append(json.dumps({
+            "t": ts,
+            "h": item["host"],
+            "p": item["port"],
+            "ok": bool(r.get("success")),
+            "kind": r.get("failure_kind"),
+            "ms": r.get("latency_ms"),
+            "act": "pruned" if node_key(item) in pruned else "kept",
+        }, ensure_ascii=False, separators=(",", ":")))
+    return out
+
+
+def write_history(session, new_lines):
+    """追加到 JSONL 并保留最后 HEARTBEAT_HISTORY_MAX 行。
+
+    历史读不到 (404) 从空开始; 读失败 (5xx/超时) 则**整轮不写** ——
+    用空历史覆盖线上, 等于把攒了几周的数据一次删光, 比少记一轮严重得多。
+    """
+    if HEARTBEAT_HISTORY_MAX <= 0 or not new_lines:
+        return None
+    state, value = fetch_probe(session, f"{_BASE}/{HISTORY_NAME}", "线上历史记录")
+    if state == "error":
+        vg.warn(f"历史记录读取失败 ({value}) — 本轮不追加, 避免覆盖已攒下的数据")
+        return None
+    old = [ln for ln in (value or "").splitlines() if ln.strip()] if state == "ok" else []
+    merged = (old + new_lines)[-HEARTBEAT_HISTORY_MAX:]
+    with open(os.path.join(vg.PUBLIC_DIR, HISTORY_NAME), "w", encoding="utf-8") as f:
+        f.write("\n".join(merged) + "\n")
+    vg.log("HEARTBEAT", f"历史记录 {len(old)} -> {len(merged)} 行 ({HISTORY_NAME})")
+    return len(merged)
+
+
+# ---------------------------------------------------------------------------
 # 网络
 # ---------------------------------------------------------------------------
-def fetch_text(session, url, what):
+def _status_of(exc):
+    """从异常里抠出 HTTP 状态码。
+
+    vg._http_get 对 4xx 是**抛 _NoRetryHTTPError**、对 5xx 是重试后抛 RuntimeError,
+    也就是说 404 永远走不到 `r.status_code` 那个分支。要区分「文件不存在」和「这次没读到」,
+    只能从异常里把状态码取回来 —— 否则一个首次部署还没生成 endpoints.json 的站点,
+    会被判成「读取失败」而永久跳过部署。
+    """
+    code = getattr(exc, "status_code", None)
+    if isinstance(code, int):
+        return code
+    m = re.search(r"HTTP[ /](\d{3})", str(exc))
+    return int(m.group(1)) if m else None
+
+
+def fetch_probe(session, url, what):
+    """返回 (state, value): state ∈ {"ok", "missing", "error"}。
+
+    「线上没有这个文件」和「这次没读到」必须分开, 因为它们的正确反应完全相反:
+      * missing (404/410): 该文件本来就不存在 —— 首轮、或某个可选产物没生成。可以继续。
+      * error  (5xx/超时/空 body): 文件在线上, 只是这一瞬间没拿到。若当成 missing 处理,
+        镜像就不完整, 整站部署会把那个文件从线上删掉 —— 一次网络抖动换一个线上故障。
+    """
     try:
         r = vg._http_get(session, f"{url}{'&' if '?' in url else '?'}t={int(time.time())}")
-        if r.status_code != 200:
-            vg.log("HEARTBEAT", f"{what} 不可用 (HTTP {r.status_code})")
-            return None
-        if not (r.text or "").strip():
-            # HTTP 200 但空 body 与 404 在语义上等价 (站点刚部署完、Pages 缓存穿透等),
-            # 所以归为"不可用"。分开报是为了排查时不会把 200 当成"拿到了"。
-            vg.log("HEARTBEAT", f"{what} 内容为空 (HTTP 200), 视为不可用")
-            return None
-        return r.text
     except Exception as exc:
-        vg.log("HEARTBEAT", f"读取 {what} 失败: {type(exc).__name__}: {exc}")
+        if _status_of(exc) in (404, 410):
+            return "missing", None
+        return "error", f"{type(exc).__name__}: {exc}"
+    if r.status_code in (404, 410):
+        return "missing", None
+    if r.status_code != 200:
+        return "error", f"HTTP {r.status_code}"
+    if not (r.text or "").strip():
+        # HTTP 200 + 空 body: Pages 在部署切换的瞬间会这样。既不能当"有内容", 也不能当
+        # "没有这个文件", 归为 error 让调用方放弃本轮部署最安全。
+        return "error", "HTTP 200 但内容为空"
+    return "ok", r.text
+
+
+def fetch_text(session, url, what):
+    state, value = fetch_probe(session, url, what)
+    if state != "ok":
+        vg.log("HEARTBEAT", f"{what} 不可用 ({state}: {value or '不存在'})")
         return None
+    return value
 
 
 def load_prev_heartbeat(session):
@@ -387,34 +532,43 @@ STAGE_FILES = (
 def stage_public(session, nodes_text):
     """把线上现存的整站产物镜像到 public/, 保证部署不会误删文件。
 
-    返回 (ok, missing): ok 表示能构成一个可部署的站点 (nodes.txt + index.html 都在)。
+    返回 (ok, missing, errors):
+      ok      : 能构成一个可部署的站点 (index.html 有着落, 且没有临时读取失败)
+      missing : 线上确实不存在 (404) —— 允许缺, 但要记录
+      errors  : 存在但这次没读到 (5xx / 超时 / 空 body) —— 有任何一个就不许部署
     """
     os.makedirs(vg.PUBLIC_DIR, exist_ok=True)
     with open(os.path.join(vg.PUBLIC_DIR, NODES_FILENAME), "w", encoding="utf-8") as f:
         f.write(nodes_text)
 
-    missing = []
+    missing, errors = [], []
     for name, _required in STAGE_FILES:
-        text = fetch_text(session, f"{_BASE}/{name}", f"线上 {name}")
-        if text is None:
+        state, value = fetch_probe(session, f"{_BASE}/{name}", f"线上 {name}")
+        if state == "missing":
             missing.append(name)
             continue
+        if state != "ok":
+            errors.append(f"{name}: {value}")
+            continue
         with open(os.path.join(vg.PUBLIC_DIR, name), "w", encoding="utf-8") as f:
-            f.write(text)
+            f.write(value)
 
     if "index.html" in missing:
-        # 页面模板在仓库里有, 线上拿不到就用它兜底 —— 没有 index.html 的站点等于不可用
+        # 页面模板在仓库里有, 线上确实没有就用它兜底 —— 没有 index.html 的站点等于不可用
         try:
             with open(os.path.join(vg.PUBLIC_DIR, "index.html"), "w", encoding="utf-8") as f:
                 f.write(vg.render_html())
             missing.remove("index.html")
-            vg.log("HEARTBEAT", "线上 index.html 缺失, 已用仓库模板兜底生成")
+            vg.log("HEARTBEAT", "线上 index.html 不存在, 已用仓库模板兜底生成")
         except Exception as exc:
             vg.warn(f"生成兜底 index.html 失败: {type(exc).__name__}: {exc}")
 
     if missing:
-        vg.log("HEARTBEAT", f"未能镜像的站点文件 (部署后可能缺失): {', '.join(missing)}")
-    return ("index.html" not in missing), missing
+        vg.log("HEARTBEAT", f"线上不存在的站点文件 (404, 部署后仍缺): {', '.join(missing)}")
+    if errors:
+        # 这条不能降级成 warning: 缺文件的整站部署 = 主动删线上文件
+        vg.warn(f"镜像站点时读取失败, 本轮不许部署 (否则会从线上删掉这些文件): {'; '.join(errors)}")
+    return ("index.html" not in missing) and not errors, missing, errors
 
 
 
@@ -444,7 +598,7 @@ def main():
     session = requests.Session()
     started = time.time()
 
-    vg.log("HEARTBEAT", f"预算 {HEARTBEAT_BUDGET} 个 / 并发 {HEARTBEAT_CONCURRENCY} / 超时 {HEARTBEAT_TIMEOUT}s / "
+    vg.log("HEARTBEAT", f"并发 {HEARTBEAT_CONCURRENCY} / 超时 {HEARTBEAT_TIMEOUT}s / "
                         f"连续 {HEARTBEAT_CONFIRM} 轮确认才摘 / 摘后下限 {HEARTBEAT_MIN_ALIVE}")
 
     if not vg.WORKER_URL_OK:
@@ -473,10 +627,19 @@ def main():
 
     prev = load_prev_heartbeat(session)
     prev_streak = prev.get("dead_streak") or {}
+    prev_escalate = int(prev.get("escalate_streak") or 0)
     cursor = int(prev.get("cursor") or 0)
-    vg.log("HEARTBEAT", f"线上节点 {len(items)} 个, 历史死链记录 {len(prev_streak)} 条, 采样游标 {cursor}")
 
-    targets, next_cursor = select_targets(items, HEARTBEAT_BUDGET, cursor, prev_streak)
+    # 预算必须按真实节点数定, 不能只看环境变量: 同一个值在 N=17 时够用, 在 N=200 时
+    # 会让确认窗口远远超出发布周期, 而症状只是「从来不摘」。
+    budget = resolve_budget(len(items))
+    scale = scale_warning(len(items), budget)
+    if scale:
+        vg.warn(scale)
+    vg.log("HEARTBEAT", f"线上节点 {len(items)} 个, 本轮预算 {budget} 个, 历史死链记录 {len(prev_streak)} 条, "
+                        f"采样游标 {cursor}" + (f", 上一轮连续升级重跑 {prev_escalate} 次" if prev_escalate else ""))
+
+    targets, next_cursor = select_targets(items, budget, cursor, prev_streak)
     vg.log("HEARTBEAT", f"本轮复检 {len(targets)} 个: " + ", ".join(f"{t['host']}:{t['port']}" for t in targets[:6]) +
                         (" ..." if len(targets) > 6 else ""))
 
@@ -491,36 +654,59 @@ def main():
     vg.log("HEARTBEAT", verdict["reason"])
 
     # 先把整站镜像到 public/, 再在其上做修改 —— 顺序不能反 (原因见 stage_public 注释)
-    staged, missing = stage_public(session, nodes_text)
-    deploy_enabled = True
-    if not staged:
-        vg.warn("无法构成完整站点 (缺 index.html) — 本轮放弃部署, 只更新本地 heartbeat.json, 线上保持原样")
-        deploy_enabled = False
+    staged, missing, stage_errors = stage_public(session, nodes_text)
+    deploy_enabled = staged
+    if stage_errors:
+        vg.warn("镜像站点时遇到临时读取失败 — 本轮不部署, 线上保持原样 (整站替换会删掉没镜像到的文件)")
+
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    checked = verdict["alive"] + verdict["dead"] + verdict["untested"]
+
+    # 连续升级重跑的闸门: 完整流水线一轮上百个请求, 不能每小时都跑一次。
+    # 超过 HEARTBEAT_ESCALATE_MAX 后仍然记录状态, 但不再重跑 —— 长期大面积失效是 12h 主流程的活,
+    # 每小时重跑只会把配额和 Actions 分钟数一起烧掉, 并不能让节点变活。
+    escalate_streak = (prev_escalate + 1) if verdict["outcome"] == "escalate" else 0
+    escalate_allowed = verdict["outcome"] == "escalate" and escalate_streak <= HEARTBEAT_ESCALATE_MAX
+    outcome, reason = verdict["outcome"], verdict["reason"]
+    if outcome == "escalate" and not escalate_allowed:
+        outcome = "escalate_cooldown"
+        reason = (f"{reason}; 已连续 {escalate_streak} 轮触发升级, 超过 HEARTBEAT_ESCALATE_MAX="
+                  f"{HEARTBEAT_ESCALATE_MAX}, 本轮只记录不重跑 (等 check.yml 的 12h 主流程)")
 
     status = {
-        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"),
+        "generated_at": ts,
         "duration_s": round(time.time() - started, 1),
-        "outcome": verdict["outcome"],
-        "reason": verdict["reason"],
+        "outcome": outcome,
+        "reason": reason,
         "changed": bool(verdict["prune"]),
         "published_nodes": len(items),
-        "checked": verdict["alive"] + verdict["dead"] + verdict["untested"],
+        "checked": checked,
         "alive": verdict["alive"],
         "dead": verdict["dead"],
         "untested": verdict["untested"],
+        # untested 占比是「心跳是否还有效」的体检指标: 持续高于 30% 说明检测额度不够
+        # (大量 worker_error / 熔断), 此时心跳实际上在「只测不摘」。
+        "untested_ratio": round(verdict["untested"] / float(checked), 3) if checked else 0.0,
         "dead_ratio": round(verdict["ratio"], 3),
         "pruned": sorted(verdict["prune"]),
         "pruned_count": len(verdict["prune"]),
         "remaining": len(items) - len(verdict["prune"]),
         "dead_streak": verdict["streak"],
+        "escalate_streak": escalate_streak,
         "cursor": next_cursor,
-        "budget": HEARTBEAT_BUDGET,
+        "budget": budget,
+        "budget_auto": HEARTBEAT_BUDGET_AUTO,
         "confirm": HEARTBEAT_CONFIRM,
         "min_alive": HEARTBEAT_MIN_ALIVE,
         "rate_limited_ports": tripped,
         "throttle": limiter.snapshot() if hasattr(limiter, "snapshot") else {},
         "run_id": os.environ.get("GITHUB_RUN_ID") or None,
+        "deploy": deploy_enabled,
+        "staging_missing": missing,
+        "staging_errors": stage_errors,
     }
+    if scale:
+        status["scale_warning"] = scale
 
     if verdict["prune"]:
         new_text = prune_nodes_text(items, verdict["prune"])
@@ -553,22 +739,32 @@ def main():
     else:
         vg.log("HEARTBEAT", "无需改动, 不重写任何产物")
 
+    # 时序记录独立于摘除动作: 没摘也要记, 否则「存活率」永远只有失败样本。
+    history_count = write_history(session, history_lines(items, results, verdict["prune"], ts))
+    if history_count is not None:
+        status["history_lines"] = history_count
+
     vg.write_json(os.path.join(vg.PUBLIC_DIR, HEARTBEAT_NAME), status)
 
-    if verdict["outcome"] == "escalate":
-        vg.warn("建议升级为完整重跑 (workflow 将执行 vpngate.py)")
+    if escalate_allowed:
+        vg.warn(f"建议升级为完整重跑 (workflow 将执行 vpngate.py; 第 {escalate_streak}/{HEARTBEAT_ESCALATE_MAX} 次)")
         _set_output("escalate", "true")
     else:
+        if verdict["outcome"] == "escalate":
+            vg.warn("本轮已进入升级冷却期, 不再重跑完整流水线")
         _set_output("escalate", "false")
     _set_output("changed", "true" if status["changed"] else "false")
     _set_output("pruned", str(status["pruned_count"]))
     _set_output("remaining", str(status["remaining"]))
-    # deploy=false 时 workflow 跳过 Pages 部署 —— 只用于「站点不完整」这一种情况,
+    # deploy=false 时 workflow 跳过 Pages 部署 —— 用于「站点不完整」或「镜像遇到临时故障」,
     # 因为整站替换会把缺失的文件从线上删掉。其余情况一律部署, 让 heartbeat.json 保持新鲜。
     _set_output("deploy", "true" if deploy_enabled else "false")
 
     vg.log("HEARTBEAT", f"完成: outcome={status['outcome']} changed={status['changed']} 耗时 {status['duration_s']}s")
-    if verdict["outcome"] == "escalate":
+
+    if stage_errors:
+        return 4
+    if escalate_allowed:
         return 3
     return 0
 

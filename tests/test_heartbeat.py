@@ -230,5 +230,100 @@ class TestPruneDataJson(unittest.TestCase):
         self.assertEqual(self.DATA, original, "prune_data_json 不应改动调用方传入的对象")
 
 
+class BudgetTest(unittest.TestCase):
+    """预算与规模: 这两个纯函数决定了「心跳是不是在空转」。
+
+    N 超过 budget*6 时, 连续 2 轮确认要跑超过 12 小时, 而 check.yml 每 12 小时整站重发,
+    证据会被清掉 —— 症状是「每小时都在跑、从来不摘」, 没有告警就永远查不出来。
+    """
+
+    _FIELDS = ("HEARTBEAT_BUDGET_AUTO", "HEARTBEAT_BUDGET", "HEARTBEAT_CONFIRM",
+               "HEARTBEAT_BUDGET_FLOOR", "HEARTBEAT_BUDGET_CEIL")
+
+    def _with(self, **kw):
+        self._saved = tuple(getattr(hb, f) for f in self._FIELDS)
+        for k, v in kw.items():
+            setattr(hb, k, v)
+
+    def tearDown(self):
+        if hasattr(self, "_saved"):
+            for name, value in zip(self._FIELDS, self._saved):
+                setattr(hb, name, value)
+
+    def test_auto_keeps_floor_for_small_site(self):
+        self._with(HEARTBEAT_BUDGET_AUTO=True, HEARTBEAT_CONFIRM=2,
+                   HEARTBEAT_BUDGET_FLOOR=12, HEARTBEAT_BUDGET_CEIL=48)
+        self.assertEqual(hb.resolve_budget(17), 12, "小站点不该被自动预算削到 12 以下")
+
+    def test_auto_scales_with_node_count(self):
+        self._with(HEARTBEAT_BUDGET_AUTO=True, HEARTBEAT_CONFIRM=2,
+                   HEARTBEAT_BUDGET_FLOOR=12, HEARTBEAT_BUDGET_CEIL=48)
+        self.assertEqual(hb.resolve_budget(120), 20)   # ceil(120 / (12//2))
+        self.assertEqual(hb.resolve_budget(200), 34)
+
+    def test_auto_respects_ceiling(self):
+        self._with(HEARTBEAT_BUDGET_AUTO=True, HEARTBEAT_CONFIRM=2,
+                   HEARTBEAT_BUDGET_FLOOR=12, HEARTBEAT_BUDGET_CEIL=48)
+        self.assertEqual(hb.resolve_budget(4000), 48, "上限用于兜住请求量, 不能随 N 无限增长")
+
+    def test_fixed_budget_is_not_scaled(self):
+        self._with(HEARTBEAT_BUDGET_AUTO=False, HEARTBEAT_BUDGET=12,
+                   HEARTBEAT_CONFIRM=2, HEARTBEAT_BUDGET_FLOOR=12, HEARTBEAT_BUDGET_CEIL=48)
+        self.assertEqual(hb.resolve_budget(999), 12)
+
+    def test_scale_warning_is_silent_when_window_fits(self):
+        self.assertIsNone(hb.scale_warning(17, 12))
+        self.assertIsNone(hb.scale_warning(72, 12), "72/12=6h, 2 轮正好 12h, 仍在发布周期内")
+
+    def test_scale_warning_names_the_failure_mode(self):
+        msg = hb.scale_warning(200, 12)
+        self.assertIsNotNone(msg)
+        self.assertIn("只测不摘", msg)
+        self.assertIn("HEARTBEAT_BUDGET=auto", msg)
+
+
+class FetchProbeTest(unittest.TestCase):
+    """404 与 5xx 必须分开: 前者允许继续, 后者必须放弃本轮部署。"""
+
+    def _probe(self, status, text="", boom=None):
+        class _R:
+            status_code = status
+
+        _R.text = text
+
+        def fake(session, url):
+            if boom:
+                raise boom
+            return _R()
+
+        saved = hb.vg._http_get
+        hb.vg._http_get = fake
+        try:
+            return hb.fetch_probe(None, "https://x.example/y", "y")
+        finally:
+            hb.vg._http_get = saved
+
+    def test_200_with_body_is_ok(self):
+        self.assertEqual(self._probe(200, "content"), ("ok", "content"))
+
+    def test_404_and_410_are_missing(self):
+        self.assertEqual(self._probe(404)[0], "missing")
+        self.assertEqual(self._probe(410)[0], "missing")
+
+    def test_5xx_is_error(self):
+        state, detail = self._probe(503)
+        self.assertEqual(state, "error")
+        self.assertIn("503", detail)
+
+    def test_empty_body_on_200_is_error(self):
+        # Pages 在部署切换的一瞬间会返回 200 + 空 body: 既不是"有文件", 也不是"没文件"
+        self.assertEqual(self._probe(200, "  ")[0], "error")
+
+    def test_exception_is_error(self):
+        state, detail = self._probe(200, boom=TimeoutError("timed out"))
+        self.assertEqual(state, "error")
+        self.assertIn("TimeoutError", detail)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

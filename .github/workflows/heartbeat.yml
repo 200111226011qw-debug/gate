@@ -52,12 +52,20 @@ jobs:
           # 心跳是在已发布产物上做增量探测, 请求量必须比主流程更保守:
           # 它每小时跑一次, 额度放大 24 倍, 并发再拉高就等于主动触发 429。
           CHECK_MIN_INTERVAL: "0.5"
-          HEARTBEAT_BUDGET: "12"
+          # 预算写 auto: 按线上节点数自动取值, 保证「连续 2 轮确认」能落在 12 小时发布周期内。
+          # 固定 12 只在节点数 <= 72 时成立; 节点变多而预算不变的表现是「一直在跑、从来不摘」。
+          HEARTBEAT_BUDGET: "auto"
+          HEARTBEAT_BUDGET_FLOOR: "12"
+          HEARTBEAT_BUDGET_CEIL: "48"
           HEARTBEAT_CONCURRENCY: "2"
           HEARTBEAT_TIMEOUT: "30"
           HEARTBEAT_CONFIRM: "2"
           HEARTBEAT_MIN_ALIVE: "5"
           HEARTBEAT_MAX_DEAD_RATIO: "0.5"
+          # 连续触发几次完整重跑后进入冷却 (只记录不重跑), 避免每小时烧一遍上百请求
+          HEARTBEAT_ESCALATE_MAX: "2"
+          # 时序记录: 每行一个节点, 保留最近 4000 行 (约 2 周)。攒够就能按历史存活率排序。
+          HEARTBEAT_HISTORY_MAX: "4000"
         run: |
           set +e
           python heartbeat.py
@@ -70,6 +78,10 @@ jobs:
           fi
           if [ "$code" = "3" ]; then
             echo "::warning::样本确认不通比例过高 — 交下一步完整重跑, 本轮不做部分摘除"
+          fi
+          if [ "$code" = "4" ]; then
+            # 临时故障 (503/超时) 不是故障工单, 是「这一小时不发布」: 缺文件的整站部署会删线上文件。
+            echo "::warning::镜像站点时遇到临时读取失败 — 本轮跳过部署 (线上保持原样), 下一小时自动重试"
           fi
 
       # 只在"大面积失效"时升级: 部分摘除治不了病根, 需要重新抓源 + 重新检测。
@@ -104,6 +116,10 @@ jobs:
           if [ -f public/nodes.txt ]; then
             echo "---------- public/nodes.txt 前 3 行 (共 $(wc -l < public/nodes.txt) 行) ----------"
             head -n 3 public/nodes.txt
+          fi
+          if [ -f public/heartbeat-history.jsonl ]; then
+            echo "---------- 时序记录: $(wc -l < public/heartbeat-history.jsonl) 行 ----------"
+            tail -n 3 public/heartbeat-history.jsonl
           fi
 
       - name: Configure Pages

@@ -211,30 +211,105 @@ https://你的GitHub用户名.github.io/仓库名/nodes.txt
 1. **只摘「确认节点侧不通」的。** `target_ratelimit`（限流未测）与 `worker_error`（检测服务异常）
    一律保留 —— 它们代表「没测成」而不是「测出来不通」。把未测当不通，会在 Worker 抽风的那一小时里
    把整个订阅洗掉。
-2. **同一节点连续 `HEARTBEAT_CONFIRM` 轮确认才摘。** 证据跨轮累积在 `heartbeat.json`；
-   单轮结论可能是误判（路由抖动、证书问题）。
+2. **同一节点连续 `HEARTBEAT_CONFIRM` 轮确认才摘，且当轮必须仍是 `node_dead`。** 证据跨轮累积在
+   `heartbeat.json`；单轮结论可能是误判（路由抖动、证书问题）。旧证据不能支撑新动作 —— 一个已连判
+   两轮的节点，第三轮因 Worker 抽风变成「未测」时，绝不能因为 streak 仍是 2 就被摘。
 3. **摘后不足 `HEARTBEAT_MIN_ALIVE`，或单轮确认不通占比超过 `HEARTBEAT_MAX_DEAD_RATIO` → 不摘**，
    改用退出码 `3` 让 workflow 跑一次完整重跑。大面积失效要重新抓源，不是就地砍订阅。
 
+### 规模假设（先看这一条，再决定要不要开）
+
+每轮复检 `HEARTBEAT_BUDGET` 个节点，所以「覆盖一整张表」要 `ceil(N/budget)` 轮，
+「同一节点凑够 `confirm` 次确认」要 `ceil(N/budget) × confirm` 小时。它必须小于 12 小时发布周期：
+
+| N（线上节点数） | 覆盖一轮 | 2 轮确认 | 结论 |
+| ---: | ---: | ---: | :--- |
+| 17 | 1.4h | 2.9h | 余量充足 |
+| 100 | 8.3h | 16.7h | 超出周期，需 budget ≥ 17 |
+| 200 | 16.7h | 33.3h | 超出周期，需 budget ≥ 34 |
+
+超出的**症状不是报错，而是「每小时都在跑、从来不摘」**：证据还没攒够，`check.yml` 就发布了新产物，
+把 `heartbeat.json` 换掉了。所以：
+
+- 预算默认写 `auto`：`ceil(N / (12/confirm))`，下限 12、上限 48（`HEARTBEAT_BUDGET_FLOOR/CEIL`）；
+- 用固定值且超出时，`heartbeat.json` 会带 `scale_warning` 并打 `::warning::`，别忽略它。
+
+### 状态为什么会丢（以及怎么不丢）
+
+Pages 部署是**整站替换**：谁部署，站点上就只剩谁的 `public/`。`vpngate.py` 的产物里没有
+`heartbeat.json`，所以 `check.yml` 部署完的瞬间会把死链证据清零 —— 即使预算算得刚好，证据也会
+在每 12 小时被抹一次。因此 `check.yml` 里多了一步 **`Preserve heartbeat state`**：部署前把线上的
+`heartbeat.json` / `heartbeat-history.jsonl` 下载回 `public/`（取不到就跳过，不阻断主流程）。
+
+没有这一步，`confirm=2` 在 `ceil(N/budget) > 6` 时会永远凑不齐。这也是为什么「只改 `heartbeat.py`
+不改 `check.yml`」在 N 稍大时是无效配置。
+
+### 退出码
+
+| 退出码 | 含义 | workflow 行为 |
+| ---: | :--- | :--- |
+| `0` | 正常（可能没有任何改动，见 `heartbeat.json.changed`） | 照常部署 |
+| `1` | 拿不到线上 `nodes.txt` | `::error::`，跳过部署，线上保持原样 |
+| `3` | 样本死亡占比过高，建议完整重跑 | 同一次运行内执行 `vpngate.py`，再部署 |
+| `4` | 镜像站点时遇到临时读取失败（503/超时/空 body） | `::warning::`，跳过部署，下一小时自动重试 |
+
+`3` 是**在同一份 workflow 里**跑 `python vpngate.py`，不用 `workflow_dispatch`（那需要
+`actions: write`，容易踩 403），也不靠空 commit 触发。连续 `HEARTBEAT_ESCALATE_MAX`（默认 2）次
+之后进入 `escalate_cooldown`：只记录不重跑，把长期大面积失效交回给 12 小时主流程 ——
+否则一批长期死透的节点会让每小时都烧一遍上百个请求。
+
+### 「线上没有」和「这次没读到」不是一回事
+
+镜像时每个文件都区分三种结果：
+
+- `404/410` → **缺失**，允许继续（首次部署还没生成 `endpoints.json` 就是这种）；
+- `5xx/超时/200+空 body` → **读取失败**，本轮**不部署**（退出码 4）。整站替换下，漏镜像一个文件
+  等于主动把它从线上删掉，一次网络抖动换一个线上故障不划算。
+
+`index.html` 是唯一允许兜底的：确实 404 就用仓库模板 `render_html()` 生成；读取失败则仍然中止，
+因为兜底会把线上页面换成旧模板。
+
+### 时序记录（`heartbeat-history.jsonl`）
+
+每轮每个被测节点追加一行 `{t,h,p,ok,kind,ms,act}`，保留最近 `HEARTBEAT_HISTORY_MAX` 行（默认 4000，
+约两周）。它是「按历史存活率排序」替代「按本轮延迟排序」唯一缺的数据，而数据本身是检测的副产品。
+读不到旧文件（404）就从空开始；**读失败（5xx）则整轮不写** —— 用空历史覆盖线上等于把攒了几周的
+数据一次删光。设 `HEARTBEAT_HISTORY_MAX=0` 可关闭。
+
+### 与其它机制的关系
+
+- **`MERGE_LAST_GOOD=1`**：`check.yml` 会把上一版仍可用的节点合并回新版本，因此心跳摘掉的节点
+  可能在下一轮 check 中复现。这是预期行为 —— check 会重新验证可用性，心跳只是临时摘除。
+- **Worker 额度**：心跳请求量小但持续。如果 `heartbeat.json.untested_ratio` 长期 > 0.3，说明大量
+  请求被判为 `worker_error`/熔断，心跳实际在「只测不摘」，应降预算或扩 Worker。
+- **面板口径**：`countries` / `available` / `stats.success` / `residential_est` / `datacenter_est`
+  是**当前状态**（摘除后同步裁剪）；`raw_nodes` / `sstp_nodes` / `checked` / `carried_over` 是
+  **那一轮的历史**，保持原值不伪造。所以「已检测 62 / 可用 3」是有意为之，不是数字对不上。
+
 | 名称 | 默认值 | 说明 |
 | :--- | :--- | :--- |
-| `HEARTBEAT_BUDGET` | `12` | 单轮最多复检多少个节点。它每小时跑一次，额度放大 24 倍，别按主流程的规模设 |
+| `HEARTBEAT_BUDGET` | `auto` | 单轮复检数；`auto` 按节点数反推（下限 12 / 上限 48） |
+| `HEARTBEAT_BUDGET_FLOOR` / `_CEIL` | `12` / `48` | `auto` 的上下限 |
 | `HEARTBEAT_CONCURRENCY` | `2` | 并发，必须低于主流程 |
 | `HEARTBEAT_TIMEOUT` | `30` | 单次复检超时（秒），压过 10 分钟会与下一轮重叠 |
 | `HEARTBEAT_CONFIRM` | `2` | 连续 N 轮确认才摘除 |
 | `HEARTBEAT_MIN_ALIVE` | `MIN_SUCCESS` | 摘除后剩余下限，低于此值不动手 |
 | `HEARTBEAT_MAX_DEAD_RATIO` | `0.5` | 单轮确认不通占比超过该值 → 升级为完整重跑 |
+| `HEARTBEAT_ESCALATE_MAX` | `2` | 连续触发几次完整重跑后进入冷却 |
+| `HEARTBEAT_HISTORY_MAX` | `4000` | 时序记录保留行数，`0` 关闭 |
 
 另外两点值得知道：
 
-- **部署是整站替换。** `upload-pages-artifact` 上传什么，站点上就只剩什么。所以心跳会先把线上
-  `index.html` / `status.json` / `check-worker.js` / `endpoints.json` / `data.json` 镜像到 `public/`，
-  再改其中需要改的文件 —— 否则「只写 nodes.txt 就部署」会把其他产物从线上删掉。
-- **不碰 `status.json`。** 那份文件是「那一轮生成」的结论；心跳改写它会让面板数字与 `data.json` 对不上。
-  心跳自己的结论写在 `heartbeat.json`（含 `outcome` / 本轮口径 / 死链证据 / 采样游标）。
-- 采样带游标轮转，N 轮内可覆盖全表；不想用就删掉 `heartbeat.yml`，或在 Actions 里 disable 该 workflow。
+- **部署是整站替换。** 心跳会先把线上 `index.html` / `status.json` / `check-worker.js` /
+  `endpoints.json` / `data.json` 镜像到 `public/`，再改其中需要改的文件。
+- **不碰 `status.json`。** 那份文件是「那一轮生成」的结论；心跳改写它会让面板数字与 `data.json`
+  对不上。心跳自己的结论写在 `heartbeat.json`（含 `outcome` / 本轮口径 / 死链证据 / 采样游标 /
+  `escalate_streak` / `scale_warning`）。
+- 采样带游标轮转，`ceil(N/budget)` 轮内可覆盖全表；不想用就删掉 `heartbeat.yml`，或在 Actions 里
+  disable 该 workflow（`heartbeat.json` / `heartbeat-history.jsonl` 会在下一次 check 部署时消失，
+  不影响任何订阅）。
 
-离线测试（30 个用例，覆盖「该摘 / 不该摘」的各类边界与落盘结果）：
+离线测试（54 个用例，覆盖「该摘 / 不该摘」的边界、镜像失败分支、预算伸缩与落盘结果）：
 
 ```bash
 PYTHONPATH=tests python -m unittest discover -s tests -p "test_heartbeat*.py" -v
@@ -421,6 +496,7 @@ PYTHONPATH=tests python -m unittest discover -s tests -p "test_heartbeat*.py" -v
 
 | 日期 | 版本 | 变更 |
 | :--- | :--- | :--- |
+| 2026-10-30 | v1.7.1 | **心跳的规模与状态修正**（评审 P0/P1）：① `check.yml` 新增 `Preserve heartbeat state` —— Pages 是整站替换，原先每次 check 发布都会把 `heartbeat.json` 连同死链证据一起清掉，`confirm=2` 在 `ceil(N/budget) > 6` 时永远凑不齐（症状是「每小时都在跑、从来不摘」）；② 预算支持 `HEARTBEAT_BUDGET=auto`，按 `ceil(N/(12/confirm))` 反推（下限 12 / 上限 48），超出发布周期时写 `scale_warning` 并告警；③ 退出码 `4` 区分「线上没有这个文件」(404，允许继续) 与「这次没读到」(5xx/超时/200+空 body，禁止部署) —— `vg._http_get` 对 4xx 是抛 `_NoRetryHTTPError`，404 判断必须从异常里取状态码才生效（冒烟抓到）；④ 连续 `HEARTBEAT_ESCALATE_MAX` 次完整重跑后进入 `escalate_cooldown`，不再每小时烧一遍上百请求；⑤ 新增 `heartbeat-history.jsonl` 时序记录（每轮每节点一行，默认保留 4000 行，读失败则整轮不写，避免覆盖已攒数据）；⑥ `heartbeat.json` 增加 `untested_ratio` / `escalate_streak` / `staging_missing` / `staging_errors` / `budget_auto`。测试 30 → 54 个（新增镜像失败分支、预算伸缩、升级冷却、时序裁剪与「常量与使用点形状」结构断言） |
 | 2026-10-30 | v1.7.0 | **新增发布后心跳**（`heartbeat.py` + `heartbeat.yml`）：每小时复检线上 `nodes.txt`，把连续 `HEARTBEAT_CONFIRM` 轮确认不通的节点摘掉并重发，把「发布后 12 小时空窗」压到 1 小时。三条硬约束：只摘 `failure_kind=node_dead`（`target_ratelimit`/`worker_error` 一律保留，未测不等于不通）、证据跨轮累积且当轮必须仍是 `node_dead`（旧证据不能支撑摘除动作）、摘后低于 `HEARTBEAT_MIN_ALIVE` 或单轮死亡占比超 `HEARTBEAT_MAX_DEAD_RATIO` 则改用退出码 3 触发完整重跑。复用 `vpngate.check_one`/`PortCircuitBreaker`/`AdaptiveLimiter`，归因与熔断口径零分叉；部署前先镜像线上整站产物（Pages 部署是整站替换，漏镜像会把 `index.html`/`check-worker.js` 从线上删掉）；`data.json` 同步裁剪且 `raw_nodes`/`checked` 等「那一轮」字段保持原值，心跳结论独立写 `heartbeat.json`，不改 `status.json`。新增 30 个离线用例（`test_heartbeat.py` 判定边界 + `test_heartbeat_flow.py` 全流程落盘） |
 | 2026-10-24 | v1.6.4 | **复查完善**：`_http_get` 对 4xx（非 408/429）不再重试（URL 写错/鉴权失败重试无意义，与 `check_one` 口径一致）；`filter_edge_hosts` 新增第 0 步——入口去重 + IPv6 字面量明确剔除并告警（此前 IPv6 条目会被 DNS 检测误报「无 A 记录」，`EDGE_DNS_CHECK=0` 时更会流进产物导致发布前自检整轮拒发；节点行格式仅支持域名/IPv4，README 已声明）；`parse_mirror_json` 的 `country_short` 不再用国家全名兜底（避免 `countries.code` 出现 "Japan" 类非 2 位码，展示层回退 `country_long`）；`data.json` stats 新增 `carried_over`（MERGE 模式下区分「本轮实测」与「携带合并」）；workflow 开启 Pages 步骤增加返回码检查，失败时打明确告警并指引手动开启，查询返回 403 时同样告警（注：GITHUB_TOKEN 无 `administration` 权限键可用，该建议不可行）；`Show site URL` 改为按仓库动态拼接（fork/改名后自动正确）；`HOSTS_ENTRY` 显式路径共用同一道「去重+IPv6 剔除」清理（`_drop_unsupported_entries`），人工指定仍优先于黑名单/DNS 检测，`build_nodes_text` 的回退分支同样过清理（入口池全为不支持的格式时准确降级为「入口池配置异常」，而非误导性的「节点行格式自检未通过」），清理告警按「IPv6 条目 / 含冒号脏条目」分类；测试新增 `mirror_404` 场景与 `filter_edge_hosts` 单元断言 |
 | 2026-10-24 | v1.6.3 | **检查与完善**：`_is_cloudflare` 改用 Cloudflare 官方公布网段（ips-v4/ips-v6）精确匹配 —— 旧版 4 个「首两段」近似段漏掉 `141.101` / `108.162` / `188.114` / `190.93` / `173.245` / `103.2x` / `131.0.72` 等官方段，入口解析到这些段会被误判「疑似污染」而剔除；同时 `104.28-31` / `172.72-127` / `198.41.0-127` 放得过宽（CF 实际只到 /13 与 /17）；IPv6 前缀 `2a06:4700` 系笔误（官方段是 `2606:4700::/32` 等 7 段）。workflow「首次运行自动开启 Pages」改用 POST 创建站点（PUT 只能更新已存在的站点，对未开启 Pages 的仓库恒 404，该步骤此前从不生效），且不再携带与 `build_type=workflow` 矛盾的 `source` 参数；`CHECK_TIMEOUT` 代码默认值 90→60 与文档/CI 对齐；`log()` 加锁防并发日志交错；优选 API 行的主机名必须含点（拒绝 `abc` 这类单标签脏数据）；还原 v1.6.1 变更记录（此前表格串行损坏）；测试新增 `_is_cloudflare` 网段与 `_normalize_optimal_line` 解析的单元断言 |
