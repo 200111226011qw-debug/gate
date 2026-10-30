@@ -21,6 +21,25 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          # 下一步要检查全部提交; 默认 depth 1 只看得到最近一个提交,
+          # 拦不住「前两个提交带了冒烟产物」这种情况。
+          fetch-depth: 0
+
+      # 2026-10-30 的教训: `git add -A` 把 PUBLIC_DIR=.smokeN 的整站产物提交进了分支,
+      # 其中含 check-worker.js 的第三方副本。`git status` 干净、测试全绿也发现不了,
+      # 因为它只影响仓库卫生, 没有任何测试在管。机器执行才是防线, .gitignore 的注释不是。
+      - name: Verify no smoke artifacts in history
+        run: |
+          bad=$(git log --all --name-only --format="" | grep -E '^\.smoke' || true)
+          if [ -n "$bad" ]; then
+            echo "::error::仓库历史里有冒烟产物 (.smoke*):"
+            echo "$bad" | sort -u | head -20
+            echo ""
+            echo "处理: 用 git filter-branch 或 rebase 从历史里删掉, 不要只在新提交里删除文件"
+            exit 1
+          fi
+          echo "历史无冒烟产物"
 
       - name: Setup Python
         uses: actions/setup-python@v7

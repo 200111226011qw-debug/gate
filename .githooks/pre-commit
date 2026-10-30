@@ -1,0 +1,31 @@
+#!/bin/sh
+# 拦截冒烟产物进提交。
+#
+# 起因 (2026-10-30): `git add -A` 把 PUBLIC_DIR=.smokeN 的整站产物一起带上,
+# 其中含 check-worker.js 的第三方副本。`git status` 在 add 之后不提示、
+# 73 个测试全绿也发现不了 —— 这类错误只影响仓库卫生, 没有任何自动化在管。
+#
+# 启用: git config core.hooksPath .githooks   (仓库内一次性设置, 不强制)
+# 用 pathspec 暂存, 不要用 `git add -A`: .gitignore 的注释不是防线, 这个 hook 才是。
+
+bad=$(git diff --cached --name-only | grep -E '(^|/)\.smoke' || true)
+if [ -n "$bad" ]; then
+  echo "pre-commit: 拒绝提交 —— 暂存区里有冒烟产物:"
+  echo "$bad" | sed 's/^/  /'
+  echo ""
+  echo "这些目录是 heartbeat.py 用 PUBLIC_DIR=.smokeN 跑出来的整站产物, 只用于本地验证。"
+  echo "处理: git reset            取消暂存 (改动还在工作区)"
+  echo "      git add <具体路径>   只暂存你要改的文件, 不要用 git add -A"
+  exit 1
+fi
+
+# 顺带拦一类同源的: 被禁用的本地诊断/临时产物 (已在 .gitignore, 这里是第二道)
+bad2=$(git diff --cached --name-only | grep -E '(^|/)(public/|__pycache__/)' || true)
+if [ -n "$bad2" ]; then
+  echo "pre-commit: 拒绝提交 —— 暂存区里有运行产物 (public/ 或 __pycache__):"
+  echo "$bad2" | sed 's/^/  /'
+  echo "public/ 是 vpngate.py 的输出目录, 不入库。"
+  exit 1
+fi
+
+exit 0

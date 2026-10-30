@@ -421,11 +421,35 @@ escalate_streak 的变化规则
   disable 该 workflow（`heartbeat.json` / `heartbeat-history.jsonl` 会在下一次 check 部署时消失，
   不影响任何订阅）。
 
-离线测试（54 个用例，覆盖「该摘 / 不该摘」的边界、镜像失败分支、预算伸缩与落盘结果）：
+离线测试（73 个用例，覆盖「该摘 / 不该摘」的边界、镜像失败分支、预算伸缩与落盘结果）：
 
 ```bash
 PYTHONPATH=tests python -m unittest discover -s tests -p "test_heartbeat*.py" -v
 ```
+
+### 本地提交约定（这几条是事故换来的）
+
+2026-10-30 有一次 `git add -A` 把 `PUBLIC_DIR=.smokeN` 的整站产物提交进了分支，其中含
+`check-worker.js` 的第三方副本。它**同时通过了所有检查**：`git status` 干净、测试全绿、CI 也会绿 ——
+因为这类错误只影响仓库卫生，没有任何自动化在管。最后靠 `git filter-branch` 重写历史才清掉。
+
+所以约定三条：
+
+1. **暂存用 pathspec，不要用 `git add -A`**。`.gitignore` 的注释不是防线 —— 那次事故时注释就写在那儿。
+2. **提交前核对文件清单**：`git diff --cached --stat`。`git status` 干净不代表提交干净，
+   因为产物被 `add` 之后 `status` 就不会提示了。
+3. **启用 pre-commit hook**（仓库内一次性设置）：
+
+   ```bash
+   git config core.hooksPath .githooks
+   ```
+
+   hook 会拒绝暂存区里的 `.smoke*` / `public/` / `__pycache__`。即使本地没启用，
+   `check.yml` 的 `Verify no smoke artifacts in history` 也会在 CI 里拦住 —— 它查的是**全部提交**，
+   所以 Checkout 用了 `fetch-depth: 0`（默认 depth 1 只看得到最近一个提交）。
+
+顺带：冒烟目录请用 `PUBLIC_DIR=.smokeN`，已被 `.gitignore` 忽略；删它用 `rm -rf .smokeN`，
+别等攒到一起再 `git add -A`。
 
 ---
 
