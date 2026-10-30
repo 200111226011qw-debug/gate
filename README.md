@@ -438,15 +438,22 @@ PYTHONPATH=tests python -m unittest discover -s tests -p "test_heartbeat*.py" -v
 1. **暂存用 pathspec，不要用 `git add -A`**。`.gitignore` 的注释不是防线 —— 那次事故时注释就写在那儿。
 2. **提交前核对文件清单**：`git diff --cached --stat`。`git status` 干净不代表提交干净，
    因为产物被 `add` 之后 `status` 就不会提示了。
-3. **启用 pre-commit hook**（仓库内一次性设置）：
+3. **启用 pre-commit hook**（仓库内一次性设置，**默认不生效**）：
 
    ```bash
    git config core.hooksPath .githooks
    ```
 
-   hook 会拒绝暂存区里的 `.smoke*` / `public/` / `__pycache__`。即使本地没启用，
-   `check.yml` 的 `Verify no smoke artifacts in history` 也会在 CI 里拦住 —— 它查的是**全部提交**，
-   所以 Checkout 用了 `fetch-depth: 0`（默认 depth 1 只看得到最近一个提交）。
+   hook 会拒绝暂存区里的 `.smoke*` / `public/` / `__pycache__`。
+
+   **不配置这一行，这道防线就不存在** —— `.githooks/` 只是入库的文件，git 不会自动执行它。
+   那时你只剩 CI 一道：`check.yml` 的第 2 步 `Verify no smoke artifacts in history`，
+   它查 `git log --all --name-only`，所以 Checkout 用了 `fetch-depth: 0`
+   （默认 depth 1 只看得到最近一个提交，拦不住「前两个提交带了冒烟产物」）。
+
+   两道防线的分工要说清：**CI 拦的是「推上去之后」，hook 拦的是「推之前」。**
+   前者能兜底但已经污染了远程历史（要 `filter-branch` 才清得掉），后者拦住就不会走到那一步。
+   所以 hook 是主力，CI 是兜底 —— 反过来说「入库了就等于有防线」是错的。
 
 顺带：冒烟目录请用 `PUBLIC_DIR=.smokeN`，已被 `.gitignore` 忽略；删它用 `rm -rf .smokeN`，
 别等攒到一起再 `git add -A`。
