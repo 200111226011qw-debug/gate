@@ -300,6 +300,15 @@ escalate_streak 的变化规则
 节点真的恢复后（`ratio` 回落到阈值以下、或摘除不再跌破下限），那一轮判 `ok`/`pruned`，计数清零，
 心跳回到正常摘除逻辑。
 
+**连续 `notest` 时的行为**（这是个容易被误猜的地方）：`outcome` 如实写 `notest`，**不会**变成
+`escalate_cooldown` —— 冷却只在「本轮真的判失效（`escalate`/`hold`）且计数已超限」时出现，检测端全挂
+时什么都没测到，把它写成「确认失效、只是冷却」会误导读者。`escalate_streak` 原样保持，不增不减。
+
+由此带来一个取舍：如果 `streak` 已经达到 `MAX`，检测端挂了 6 小时再恢复、节点仍然全死，那么恢复后
+第一轮就又是 `escalate_cooldown`（计数已是 `MAX+1`），不重跑。这是有意为之 —— **旧证据只会导致
+「少做」，不会导致「乱做」**。最长延迟就是一个发布周期（12 小时），由 `check.yml` 强制重跑兜底，
+所以不需要给证据加额外的保质期。
+
 **冷却期间仍然检测。** 冷却的目的是「别再每小时跑一遍完整流水线」，不是「别再看了」：只关掉重跑
 那一步，采样、判定、写 `heartbeat.json` / 时序记录照常。另外 `escalate` 与 `hold` 都**不摘任何
 节点**（`decide()` 在这两种情况下都返回空的 `prune`）—— 大面积失效要靠重新抓源，不是就地砍订阅。
@@ -317,8 +326,10 @@ escalate_streak 的变化规则
 
 - `ok` —— 测完了，没有达到确认阈值的节点，不动手
 - `pruned` —— 摘掉了确认失效的节点
-- `hold` —— 该摘，但摘了会低于 `HEARTBEAT_MIN_ALIVE`（**这是最严重的一档**，会触发重跑）
-- `notest` —— 一个都没测成（检测端不可用 / 全被熔断），本轮无结论
+- `hold` —— 该摘，但摘了会低于 `HEARTBEAT_MIN_ALIVE`。**不摘任何节点**（`prune` 为空），改触发重跑 ——
+  重跑是重新抓源，就地砍订阅只会让节点数掉到下限以下。这是最严重的一档。
+- `notest` —— 一个都没测成（检测端不可用 / 全被熔断）。**不摘、不重跑、`streak` 保持不变**，
+  本轮无结论
 - `invalid_output` —— 改写后的 `nodes.txt` 没过格式自检，放弃本次改写（重跑也修不了格式问题，所以不重跑）
 - `escalate` —— 单轮死亡占比超阈值，触发重跑
 - `escalate_cooldown` —— 计数已超 `HEARTBEAT_ESCALATE_MAX`，只记录、不重跑
@@ -592,6 +603,7 @@ PYTHONPATH=tests python -m unittest discover -s tests -p "test_heartbeat*.py" -v
 
 | 日期 | 版本 | 变更 |
 | :--- | :--- | :--- |
+| 2026-10-30 | v1.7.4 | **两个边界收口**（四轮评审）：① `hold` 时 `prune` **本来就是空集**（`decide()` 返回 `"prune": set()`），所以重跑闸门放开后不会出现「摘到低于 `MIN_ALIVE`」—— 已在 README 的 `outcome` 表里写明「不摘任何节点」，并保留 `test_hold_triggers_rerun_not_just_escalate` 的 `nodes.txt` 断言；② README 补「连续 `notest`」的行为：`outcome` 如实写 `notest`，**不会**变成 `escalate_cooldown`（冷却只在「本轮真判失效且超限」时出现），`escalate_streak` 原样保持；并说明由此带来的取舍 —— 旧证据只会导致「少做」不会导致「乱做」，最长延迟一个发布周期，由 `check.yml` 兜底。测试 71 → 72（连跑 3 轮 `notest` 验证计数不变、状态不伪装） |
 | 2026-10-30 | v1.7.3 | **冷却语义与重跑闸门修正**（三轮评审）：① `hold`（摘了会低于 `MIN_ALIVE`）现在**也会触发完整重跑** —— `decide()` 先判 `hold` 再判 `escalate`，只让 `escalate` 重跑等于漏掉最严重的一档，而它的 `reason` 里本来就写着「应重跑完整流水线」；② `notest`（一个都没测成）不再清零 `escalate_streak`，`hold` 也不再清零而是累加 —— 只有 `ok`/`pruned` 算恢复，与 `decide()` 对「未测」的口径一致；③ `heartbeat.json` 新增 `verdict` 字段保留 `decide()` 原始判定（进冷却后 `outcome` 变 `escalate_cooldown`，否则「为什么进冷却」就丢了）；④ 产物格式自检失败改用 `outcome=invalid_output`，不再与 `decide()` 的 `hold` 混用同一个名字（前者重跑也没用，后者重跑才是解法）；⑤ README 写明**冷却没有时长**（是「计数超 `MAX` 后每轮只记录」的持续态，不是「停 6 小时」）、`streak` 三条变化规则、七种 `outcome` 的含义；⑥ README 把 `auto` 预算写成**分段公式**并补 N=49 的边界行 —— 用单一公式算 N=48 会得到 8，与实际 48 差 6 倍。测试 68 → 71 |
 | 2026-10-30 | v1.7.2 | **规模与失败可见性收口**（二轮评审）：① `auto` 预算改为优先「一轮全测」—— `N ≤ CEIL` 时每轮测完全部节点，确认窗口 = `confirm` 小时（N=17 从 4h 缩到 2h），`N > CEIL` 才分批；② 把 `auto` 的**硬边界 288**（`CEIL × 12 / confirm`）写进 README 并用 `test_auto_has_a_hard_validity_ceiling_at_288` 钉住，避免「auto 永远有效」的误读；③ `check.yml` 的 `Preserve heartbeat state` 区分 `404/410`（真没有，静默）与其它码（读失败，`::warning::`），并注释了「必须在 `vpngate.py` 之后、`Upload Pages artifact` 之前」的顺序约束；④ `load_prev_heartbeat()` 在「有已发布节点却读不到状态」时告警 —— 状态被清空会让 `streak` 归零、功能静默退化，而表面上一切正常；⑤ 时序记录上限改 `auto`（每轮行数 × 24 × 天数，下限 4000）：固定 4000 在「一轮全测 48 个」时只够 3.5 天，「保留约两周」必须由 N 决定；⑥ `_status_of` 补 `exc.response.status_code` 一级并加词边界（`requests.HTTPError` 只挂 `response`），`403/401/429` 明确归「读失败」而非「缺失」；⑦ README 写明 `escalate_cooldown` 期间**仍然检测**，只关掉重跑。测试 54 → 68（新增 288 边界、一轮全测、403/401/429 归因、状态码三级取值、行数上限换算、状态缺失告警与其静默边界） |
 | 2026-10-30 | v1.7.1 | **心跳的规模与状态修正**（评审 P0/P1）：① `check.yml` 新增 `Preserve heartbeat state` —— Pages 是整站替换，原先每次 check 发布都会把 `heartbeat.json` 连同死链证据一起清掉，`confirm=2` 在 `ceil(N/budget) > 6` 时永远凑不齐（症状是「每小时都在跑、从来不摘」）；② 预算支持 `HEARTBEAT_BUDGET=auto`，按 `ceil(N/(12/confirm))` 反推（下限 12 / 上限 48），超出发布周期时写 `scale_warning` 并告警；③ 退出码 `4` 区分「线上没有这个文件」(404，允许继续) 与「这次没读到」(5xx/超时/200+空 body，禁止部署) —— `vg._http_get` 对 4xx 是抛 `_NoRetryHTTPError`，404 判断必须从异常里取状态码才生效（冒烟抓到）；④ 连续 `HEARTBEAT_ESCALATE_MAX` 次完整重跑后进入 `escalate_cooldown`，不再每小时烧一遍上百请求；⑤ 新增 `heartbeat-history.jsonl` 时序记录（每轮每节点一行，默认保留 4000 行，读失败则整轮不写，避免覆盖已攒数据）；⑥ `heartbeat.json` 增加 `untested_ratio` / `escalate_streak` / `staging_missing` / `staging_errors` / `budget_auto`。测试 30 → 54 个（新增镜像失败分支、预算伸缩、升级冷却、时序裁剪与「常量与使用点形状」结构断言） |

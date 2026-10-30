@@ -271,6 +271,26 @@ class FlowTest(unittest.TestCase):
         self.assertEqual(status["outcome"], "notest")
         self.assertEqual(status["escalate_streak"], 2, "notest 不该清零")
 
+    def test_consecutive_notest_keeps_streak_and_is_not_cooldown(self):
+        """连续 notest: 计数保持, 但 outcome 如实写 notest —— 不会伪装成 escalate_cooldown。
+
+        cooldown 只在「本轮真的判失效 (escalate/hold) 且已超限」时出现。检测端全挂时
+        什么都没测到, 把它写成 escalate_cooldown 会让读者以为「确认失效了、只是在冷却」。
+        """
+        self.remote["heartbeat.json"] = json.dumps(
+            {"dead_streak": {}, "cursor": 0, "escalate_streak": 2})
+        hb.HEARTBEAT_ESCALATE_MAX = 2
+        hb.check_batch = lambda targets, session, breaker: ({}, _Limiter())
+        for i in range(3):
+            self.assertEqual(hb.main(), 0, f"第 {i + 1} 轮 notest 不该重跑")
+            status = json.loads(self._read("heartbeat.json"))
+            self.assertEqual(status["outcome"], "notest")
+            self.assertEqual(status["escalate_streak"], 2, "连续 notest 不清零, 也不累加")
+            # 把本轮结果当作下一轮的线上状态 —— 否则每轮都是从同一个初始值开始
+            self.remote["heartbeat.json"] = json.dumps(
+                {"dead_streak": status["dead_streak"], "cursor": status["cursor"],
+                 "escalate_streak": status["escalate_streak"]})
+
     def test_cooldown_keeps_original_verdict(self):
         """进冷却后 outcome 变成 escalate_cooldown, 但原始判定必须留下来可查。"""
         hb.HEARTBEAT_MAX_DEAD_RATIO = 0.5
